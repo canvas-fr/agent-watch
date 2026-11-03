@@ -1,0 +1,90 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Agent Watch MonitorEvent 0.2",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "id",
+    "appID",
+    "sessionID",
+    "turnID",
+    "state",
+    "evidence",
+    "observedAt",
+    "source"
+  ],
+  "properties": {
+    "id": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 256,
+      "description": "Runtime also limits to 256 UTF-8 bytes and rejects newlines."
+    },
+    "sessionID": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 256,
+      "description": "Runtime also limits to 256 UTF-8 bytes and rejects newlines."
+    },
+    "turnID": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 256,
+      "description": "Runtime also limits to 256 UTF-8 bytes and rejects newlines."
+    },
+    "source": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 256,
+      "description": "Runtime also limits to 256 UTF-8 bytes and rejects newlines."
+    },
+    "appID": {
+      "enum": [
+        "doubao",
+        "antigravity",
+        "gemini",
+        "codex",
+        "claude",
+        "claude_code",
+        "dsh",
+        "devin",
+        "workbuddy",
+        "demo"
+      ]
+    },
+    "state": {
+      "enum": [
+        "unknown",
+        "running",
+        "waitingApproval",
+        "waitingInput",
+        "responseEnded",
+        "failed",
+        "cancelled"
+      ]
+    },
+    "evidence": {
+      "enum": [
+        "explicit",
+        "inferred"
+      ]
+    },
+    "observedAt": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "sequence": {
+      "type": [
+        "integer",
+        "null"
+      ]
+    },
+    "parentSessionID": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "maxLength": 256
+    }
+  }
+}

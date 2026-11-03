@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "Agent Watch DSH Adapter",
+    "description": "Writes minimal, local DeepSeek Harness session state events for Agent Watch."
+  }
+}

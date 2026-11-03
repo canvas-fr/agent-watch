@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "Agent Watch DSH 适配器",
+    "description": "向 Agent Watch 本地写入精简的 DeepSeek Harness 会话状态事件。"
+  }
+}

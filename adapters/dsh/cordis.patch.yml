@@ -1,0 +1,4 @@
+- insert:
+    - id: agent-watch-dsh
+      name: '@local/agent-watch-dsh'
+      config: {}
