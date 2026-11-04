@@ -32,11 +32,14 @@ JSON_INTEGER = re.compile(rb"-?(?:0|[1-9][0-9]*)\Z")
 
 PRE_INVOCATION_FIELDS = frozenset({"conversationId", "invocationNum", "initialNumSteps"})
 STOP_FIELDS = frozenset({"conversationId", "executionNum", "terminationReason", "fullyIdle"})
+TOOL_FIELDS = frozenset({"conversationId", "toolCall"})
 
-# The public hook contract currently documents these Stop reasons as examples.
-# It gives no cancellation reason enum, so cancellation-like values stay unknown.
-NORMAL_STOP_REASONS = frozenset({"model_stop"})
-FAILED_STOP_REASONS = frozenset({"error", "max_steps_exceeded"})
+# The web guide uses lowercase examples; the installed 2.28.2 Hook Contract
+# names ExecutorTerminationReason values. Only documented meanings are mapped.
+NORMAL_STOP_REASONS = frozenset({"model_stop", "NO_TOOL_CALL"})
+FAILED_STOP_REASONS = frozenset({"error", "max_steps_exceeded", "ERROR", "MAX_INVOCATIONS",
+                                "MAX_FORCED_INVOCATIONS", "MAX_TOKEN_BUDGET_EXCEEDED"})
+CANCELLED_STOP_REASONS = frozenset({"USER_CANCELED"})
 
 
 def private_root(home: Path) -> Path:
@@ -212,10 +215,16 @@ class MetadataJSONReader:
 
     def parse_selected_value(self, key: str, start: int, end: int) -> Any:
         raw_value = self.raw[start:end]
+        if key == "toolCall":
+            # Read the tool's name, skipping args without decoding their values.
+            return MetadataJSONReader(raw_value, frozenset({"name"})).read()
         if key in {"conversationId", "terminationReason"}:
             max_bytes = 2048 if key == "conversationId" else 128
             if not raw_value.startswith(b'"') or len(raw_value) > max_bytes:
                 raise ValueError("invalid bounded string field")
+        elif key == "name":
+            if not raw_value.startswith(b'"') or len(raw_value) > 128:
+                raise ValueError("invalid tool name")
         elif key in {"invocationNum", "initialNumSteps", "executionNum"}:
             if len(raw_value) > 20 or JSON_INTEGER.fullmatch(raw_value) is None:
                 raise ValueError("invalid sequence number")
@@ -276,7 +285,8 @@ def read_hook_payload(stream: BinaryIO, event_name: str) -> dict[str, Any]:
         raise ValueError("hook input exceeds size limit")
     if not valid_utf8(raw):
         raise ValueError("hook input is not valid UTF-8 JSON")
-    allowed = PRE_INVOCATION_FIELDS if event_name == "PreInvocation" else STOP_FIELDS
+    allowed = (PRE_INVOCATION_FIELDS if event_name == "PreInvocation" else
+               STOP_FIELDS if event_name == "Stop" else TOOL_FIELDS)
     return MetadataJSONReader(raw, allowed).read()
 
 
@@ -316,12 +326,15 @@ def acquire_lock(descriptor: int) -> None:
 
 
 def state_for_stop(termination_reason: str, fully_idle: bool) -> tuple[str, str]:
+    if termination_reason in CANCELLED_STOP_REASONS:
+        pending_suffix = ":background_pending" if not fully_idle else ""
+        return "cancelled", f"antigravity:Stop:{termination_reason}{pending_suffix}"
     if termination_reason in FAILED_STOP_REASONS:
         pending_suffix = ":background_pending" if not fully_idle else ""
         return "failed", f"antigravity:Stop:{termination_reason}{pending_suffix}"
     if termination_reason in NORMAL_STOP_REASONS:
         if fully_idle:
-            return "responseEnded", "antigravity:Stop:model_stop"
+            return "responseEnded", f"antigravity:Stop:{termination_reason}"
         return "running", "antigravity:Stop:background_tasks"
     pending_suffix = ":background_pending" if not fully_idle else ""
     return "unknown", f"antigravity:Stop:unknown_termination{pending_suffix}"
@@ -364,6 +377,10 @@ def process_payload(payload: dict[str, Any], event_name: str, home: Path) -> dic
             return None
         if type(payload.get("fullyIdle")) is not bool:
             return None
+    elif event_name in {"PreToolUse", "PostToolUse"}:
+        tool = payload.get("toolCall")
+        if not isinstance(tool, dict) or tool.get("name") != "ask_question":
+            return None
     else:
         return None
 
@@ -405,6 +422,18 @@ def process_payload(payload: dict[str, Any], event_name: str, home: Path) -> dic
                 "running",
                 "antigravity:PreInvocation",
             )
+        elif event_name in {"PreToolUse", "PostToolUse"}:
+            # Tools cannot invent a task identity or revive a terminal turn.
+            if current_turn is None:
+                return None
+            sequence += 1
+            state_data = {
+                "conversationId": conversation_id, "turnID": current_turn,
+                "sequence": sequence, "active": True,
+            }
+            state = "waitingInput" if event_name == "PreToolUse" else "running"
+            event = event_record(conversation_id, current_turn, sequence, state,
+                                 f"antigravity:{event_name}:ask_question")
         else:
             # executionNum is introduced only by Stop. It must never create a
             # new turn: without an open PreInvocation turn, ignore this event.
@@ -420,7 +449,7 @@ def process_payload(payload: dict[str, Any], event_name: str, home: Path) -> dic
                 # A failed foreground execution is terminal in the shared
                 # state machine. A later retry must begin a new observation
                 # turn even if background work from the failed one remains.
-                "active": not payload["fullyIdle"] and state != "failed",
+                "active": not payload["fullyIdle"] and state not in {"failed", "cancelled"},
             }
             event = event_record(conversation_id, turn_id, sequence, state, source)
 
@@ -446,7 +475,7 @@ def process_payload(payload: dict[str, Any], event_name: str, home: Path) -> dic
 
 def main(arguments: list[str] | None = None, stdin: BinaryIO | None = None, stdout: Any = None) -> int:
     parser = argparse.ArgumentParser(description="Record Antigravity lifecycle metadata for Agent Watch.")
-    parser.add_argument("--event", required=True, choices=("PreInvocation", "Stop"))
+    parser.add_argument("--event", required=True, choices=("PreInvocation", "Stop", "PreToolUse", "PostToolUse"))
     parser.add_argument("--home", type=Path, help=argparse.SUPPRESS)
     parser.add_argument("--agent-watch-owner", help=argparse.SUPPRESS)
     options = parser.parse_args(arguments)
@@ -464,7 +493,7 @@ def main(arguments: list[str] | None = None, stdin: BinaryIO | None = None, stdo
     # inject steps or continue the loop; only `continue` blocks Stop according
     # to the Hooks contract.
     try:
-        if options.event == "Stop":
+        if options.event in {"Stop", "PreToolUse"}:
             output_stream.write('{"decision":"allow"}\n')
         else:
             output_stream.write("{}\n")

@@ -5,6 +5,7 @@ from __future__ import annotations
 import fcntl
 import hashlib
 import json
+import os
 from pathlib import Path
 import runpy
 import shutil
@@ -787,12 +788,37 @@ def check_installer() -> None:
             assert len(managed_handlers(app_document, app_id)) == 9
 
 
+def check_claude_hook_import_guard() -> None:
+    with tempfile.TemporaryDirectory(prefix="Agent Watch host routing ") as temporary:
+        home = Path(temporary)
+        result = run_script(INSTALLER, "--app", "claude_code", "--home", str(home), "--apply")
+        assert result.returncode == 0
+        config = json.loads((home / ".claude/settings.json").read_text())
+        command = managed_handlers(config, "claude_code")[0]["command"]
+        # Execute the actual shell guard; fixture --home is inserted before
+        # the ownership comment rather than changing the system HOME value.
+        command = command.partition("# agent-watch-managed:")[0] + shlex.join(["--home", str(home)])
+        payload = hook_payload("UserPromptSubmit", session_id="routing-test", prompt_id="routing-turn")
+        environment = os.environ.copy()
+        environment["DEVIN_PROJECT_DIR"] = str(home / "a folder with spaces")
+        imported = subprocess.run(command, shell=True, input=payload, env=environment,
+                                  capture_output=True, text=True, timeout=3)
+        assert imported.returncode == 0 and imported.stdout == imported.stderr == ""
+        assert read_events(home) == [], "a Devin-imported hook must not create a Claude row"
+        environment.pop("DEVIN_PROJECT_DIR")
+        native = subprocess.run(command, shell=True, input=payload, env=environment,
+                                capture_output=True, text=True, timeout=3)
+        assert native.returncode == 0 and native.stdout == native.stderr == ""
+        assert len(read_events(home)) == 1 and read_events(home)[0]["appID"] == "claude_code"
+
+
 def main() -> None:
     check_event_bridge()
     check_waiting_input_tool_names()
     check_lifecycle_recovery()
     check_subagent_state_identity()
     check_installer()
+    check_claude_hook_import_guard()
     print("PASS: metadata-only lifecycle recovery, child session continuity, legacy migration, installer safety, and quoted paths")
 
 

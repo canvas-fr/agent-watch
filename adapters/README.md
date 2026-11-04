@@ -3,7 +3,9 @@
 The hook bridge records lifecycle metadata for Claude Code, Codex, WorkBuddy,
 and the legacy Cascade agent in Devin Desktop. It does not store prompts, tool
 arguments, replies, transcripts, or approval decisions. Devin support covers
-legacy Cascade only; it does not establish Devin Local or Devin CLI support.
+legacy Cascade only. The separate [Devin Local adapter](DEVIN-LOCAL.md) uses the
+current lifecycle contract; its desktop runtime acceptance remains pending.
+Antigravity has a separate [desktop bridge](ANTIGRAVITY.md).
 
 ## Requirements and storage
 
@@ -86,13 +88,19 @@ want to discard those local records.
 
 - Claude Code hooks follow Anthropic's command-hook event and stdin JSON
   contract. This does not establish support for Claude chat or Cowork modes.
+  Devin imports Claude configuration by default and sets `DEVIN_PROJECT_DIR`
+  in its hook runtime. Claude commands skip execution when that variable is
+  present, so imported commands do not create duplicate Claude-labelled rows.
+  No config-import preferences are changed. A nested Claude process inheriting
+  that variable is conservatively skipped too; clear it in that process only
+  after confirming the intended host. [Devin hook environment](https://docs.devin.ai/cli/extensibility/hooks/overview)
 - Codex hooks use the documented user-level `hooks.json` source. Codex trust
   review remains required.
 - The installed WorkBuddy 5.8.3 desktop bundle contains a CodeBuddy hook
   runtime and resolves its desktop configuration through `~/.workbuddy`.
-  Its packaged event dispatch includes the events used here. Real WorkBuddy
-  desktop sessions have not been exercised end to end, so installation support
-  is not a desktop compatibility acceptance result. CodeBuddy CLI support is
+  Its packaged event dispatch includes the events used here. A fixed short-reply test in the native UI reporting 5.9.3 produced
+  UserPromptSubmit and Stop. This covers that key path, not every mode or
+  approval/failure transition. CodeBuddy CLI support is
   not treated as proof that every WorkBuddy desktop mode fires the same hooks.
 
 Reference docs: [Claude Code hooks](https://code.claude.com/docs/en/hooks),

@@ -23,6 +23,7 @@ swiftc -swift-version 6 -parse-as-library -I "$binary_dir/Modules" \
 "$build_dir/window-checks"
 python3 "$project_dir/Tests/check_hooks.py"
 python3 "$project_dir/Tests/check_devin.py"
+python3 "$project_dir/Tests/check_devin_local.py"
 python3 "$project_dir/Tests/check_antigravity.py"
 swiftc -swift-version 6 -parse-as-library -I "$binary_dir/Modules" \
   "$binary_dir/AgentWatchCore.build/"*.swift.o \

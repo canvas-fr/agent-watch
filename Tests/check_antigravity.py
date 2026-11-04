@@ -261,6 +261,54 @@ def check_stop_mappings_and_orphans() -> None:
         assert not list((root_for(home) / "metadata").glob("*orphan*"))
 
 
+def check_current_app_and_question_lifecycle() -> None:
+    with tempfile.TemporaryDirectory(prefix="Antigravity question fixture ") as temporary:
+        home = Path(temporary)
+        session = "question-test"
+        tool = {"conversationId": session, "toolCall": {"name": "ask_question", "args": {"questions": [PRIVATE_SECRET]}}}
+        # A tool callback without an active task must not create a session.
+        run_adapter(home, "PreToolUse", tool)
+        assert read_events(home) == []
+        run_adapter(home, "PreInvocation", fixture_payload("PreInvocation", session))
+        before = run_adapter(home, "PreToolUse", tool)
+        after = run_adapter(home, "PostToolUse", tool)
+        assert json.loads(before.stdout) == {"decision": "allow"}
+        assert after.stdout == b"{}\n"
+        run_adapter(home, "Stop", fixture_payload("Stop", session, terminationReason="NO_TOOL_CALL"))
+        events = events_for(home, session)
+        assert [event["state"] for event in events] == ["running", "waitingInput", "running", "responseEnded"]
+        assert len({event["turnID"] for event in events}) == 1
+        assert events[-1]["source"] == "antigravity:Stop:NO_TOOL_CALL"
+        run_adapter(home, "PostToolUse", tool)
+        assert len(events_for(home, session)) == 4, "late tool callbacks cannot revive a completed turn"
+        for path in root_for(home).rglob("*.json"):
+            assert PRIVATE_SECRET not in path.read_text()
+        # Permission requests may be satisfied from a prior grant. Do not
+        # announce waitingApproval simply because ask_permission was invoked.
+        run_adapter(home, "PreInvocation", fixture_payload("PreInvocation", session))
+        tool["toolCall"]["name"] = "ask_permission"
+        run_adapter(home, "PreToolUse", tool)
+        assert len(events_for(home, session)) == 5
+        run_adapter(home, "PreToolUse", b'{"conversationId":"question-test","toolCall":{"name":"ask_question","name":"run_command"}}')
+        assert len(events_for(home, session)) == 5
+        # The same observed reason is not complete while background work remains.
+        run_adapter(home, "Stop", fixture_payload("Stop", session, terminationReason="NO_TOOL_CALL", fullyIdle=False))
+        assert events_for(home, session)[-1]["state"] == "running"
+        for reason in ("ERROR", "MAX_INVOCATIONS", "MAX_FORCED_INVOCATIONS", "MAX_TOKEN_BUDGET_EXCEEDED", "USER_CANCELED"):
+            session = "current-app-" + reason
+            run_adapter(home, "PreInvocation", fixture_payload("PreInvocation", session))
+            run_adapter(home, "Stop", fixture_payload("Stop", session, terminationReason=reason, fullyIdle=False))
+            event = events_for(home, session)[-1]
+            assert event["state"] == ("cancelled" if reason == "USER_CANCELED" else "failed")
+            run_adapter(home, "PreInvocation", fixture_payload("PreInvocation", session))
+            assert events_for(home, session)[-1]["turnID"] != event["turnID"]
+        for reason in ("TERMINAL_STEP_TYPE", "TERMINAL_CUSTOM_HOOK", "INJECTED_RESPONSE", "HALTED_STEP"):
+            session = "unclassified-" + reason
+            run_adapter(home, "PreInvocation", fixture_payload("PreInvocation", session))
+            run_adapter(home, "Stop", fixture_payload("Stop", session, terminationReason=reason))
+            assert events_for(home, session)[-1]["state"] == "unknown"
+
+
 def check_input_and_lock_bounds() -> None:
     with tempfile.TemporaryDirectory(prefix="Antigravity bounds fixture ") as temporary:
         home = Path(temporary)
@@ -340,7 +388,7 @@ def check_dry_run_apply_merge_and_uninstall() -> None:
         assert installed["agent-watch-antigravity"] == original["agent-watch-antigravity"]
         managed = installed["agent-watch-antigravity-2"]
         assert managed["enabled"] is True
-        assert set(managed) == {"enabled", "PreInvocation", "Stop"}
+        assert set(managed) == {"enabled", "PreInvocation", "Stop", "PreToolUse", "PostToolUse"}
         assert len(managed["PreInvocation"]) == len(managed["Stop"]) == 1
         for event_name in ("PreInvocation", "Stop"):
             handler = managed[event_name][0]
@@ -350,6 +398,11 @@ def check_dry_run_apply_merge_and_uninstall() -> None:
             assert str(bridge) == command_parts[1]
             assert command_parts[command_parts.index("--event") + 1] == event_name
             assert command_parts[command_parts.index("--agent-watch-owner") + 1].startswith("antigravity-v1:")
+        for event_name in ("PreToolUse", "PostToolUse"):
+            wrapper = managed[event_name][0]
+            assert wrapper["matcher"] == "^ask_question$"
+            assert len(wrapper["hooks"]) == 1
+            assert wrapper["hooks"][0]["timeout"] == 1
 
         environment = os.environ.copy()
         environment["HOME"] = str(home)
@@ -383,6 +436,8 @@ def check_dry_run_apply_merge_and_uninstall() -> None:
         assert removed["agent-watch-antigravity-2"]["enabled"] is True
         assert removed["agent-watch-antigravity-2"]["PreInvocation"] == []
         assert removed["agent-watch-antigravity-2"]["Stop"] == []
+        assert removed["agent-watch-antigravity-2"]["PreToolUse"] == []
+        assert removed["agent-watch-antigravity-2"]["PostToolUse"] == []
         assert bridge.exists(), "uninstall removes only its config marker, not stored data or bridge copy"
         assert len(events_for(home, "stable-bridge")) == 1
 
@@ -430,13 +485,32 @@ def check_unowned_bridge_is_preserved() -> None:
         assert not (home / ".gemini" / "config" / "hooks.json").exists()
 
 
+def check_nested_uninstall_preserves_other_handlers() -> None:
+    with tempfile.TemporaryDirectory(prefix="Antigravity mixed hook fixture ") as temporary:
+        home = Path(temporary)
+        assert run_manager(home, "--apply").returncode == 0
+        config = home / ".gemini/config/hooks.json"
+        doc = json.loads(config.read_text())
+        foreign = {"type": "command", "command": "echo user", "timeout": 2}
+        doc["agent-watch-antigravity"]["PreToolUse"][0]["hooks"].append(foreign)
+        doc["agent-watch-antigravity"]["PostToolUse"][0]["userMetadata"] = {"keep": True}
+        config.write_text(json.dumps(doc))
+        assert run_manager(home, "--uninstall", "--apply").returncode == 0
+        remaining = json.loads(config.read_text())["agent-watch-antigravity"]["PreToolUse"]
+        assert remaining == [{"matcher": "^ask_question$", "hooks": [foreign]}]
+        preserved = json.loads(config.read_text())["agent-watch-antigravity"]["PostToolUse"]
+        assert preserved == [{"matcher": "^ask_question$", "hooks": [], "userMetadata": {"keep": True}}]
+
+
 def main() -> None:
     check_lifecycle_pairing_and_privacy()
     check_stop_mappings_and_orphans()
+    check_current_app_and_question_lifecycle()
     check_input_and_lock_bounds()
     check_dry_run_apply_merge_and_uninstall()
     check_uninstall_only_removes_exact_marker()
     check_unowned_bridge_is_preserved()
+    check_nested_uninstall_preserves_other_handlers()
     print("PASS: Antigravity lifecycle pairing, privacy, stop boundaries, bounded input/lock, and dry-run configuration merge/uninstall")
 
 

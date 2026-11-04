@@ -99,10 +99,16 @@ def display_user_path(home: Path, path: Path) -> str:
 def command_for(app_id: str, emit_script: Path, python_executable: Path, script_digest: str) -> str:
     # This is a shell command because all three hook systems launch commands.
     # Quote both absolute paths so spaces and non-ASCII names are safe.
-    return (
+    invocation = (
         f"{shlex.quote(str(python_executable))} {shlex.quote(str(emit_script))} "
         f"--app {app_id} {marker_for(app_id)}:{script_digest[:16]}"
     )
+    if app_id == "claude_code":
+        # Devin imports Claude configuration by default, and documents this
+        # hook-runtime variable. Ignore imported hooks instead of mislabelling
+        # them as Claude. Do not change the user's config-import preferences.
+        return 'test -n "${DEVIN_PROJECT_DIR+x}" || ' + invocation
+    return invocation
 
 
 def expected_groups(app_id: str, command: str) -> list[tuple[str, str | None, dict[str, Any]]]:

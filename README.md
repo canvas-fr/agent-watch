@@ -23,10 +23,10 @@
 | Codex | hooks + 可选本地服务桥 | 已收到真实 PreToolUse 与 Stop 事件；新安装仍需客户端认可 hooks。当前本地服务桥无可代理 socket，未启动或替换服务 |
 | WorkBuddy | hooks + 窗口候选规则 | 已在界面报告 V5.9.3 的客户端收到真实 UserPromptSubmit 与 Stop |
 | DSH | 0.2.1-rc.5 只读插件 + 窗口候选规则 | 0.1.1 已通过原生管理器安装启用；独立验收已捕获等待回答及回答后的正常结束 |
-| Gemini 桌面版 | 窗口候选规则 | 探测器已读到部分结构；运行/结束语义和最小化仍待验证 |
-| 豆包 | 窗口候选规则 | 探测器曾读到窗口外壳，首次读取失败；尚未验证任务信号 |
-| Antigravity | 官方桌面事件桥 | 已配置并通过夹具；当前自动化无法完成项目选择，尚未真实验收 |
-| Devin | 旧 Cascade 事件桥 | 已配置并通过夹具；当前 Cloud/Local 会话不能外推，尚未真实验收 |
+| Gemini 桌面版 | 窗口候选规则 | 未找到可靠的轮次结束来源；[本轮调查](docs/GEMINI-DOUBAO-SIGNALS.zh-CN.md)记录内部状态符号与公开接口的区别 |
+| 豆包 | 窗口候选规则 | 窗口结构可观察；尚无确认完成的来源，Office 子应用状态不能代表主聊天 |
+| Antigravity | 桌面事件桥 + 问答工具观察 | 2.28.2 已实测运行、等待回答、回答后继续及正常结束；原生取消未收到 Stop，超时转未知 |
+| Devin | 旧 Cascade + 新 Local 事件桥 | 新 Local 生命周期适配器已实现并通过夹具；真实桌面任务和 Cloud 模式仍待验收 |
 
 ## 构建和运行
 
@@ -57,6 +57,8 @@ Codex 需通过其原生信任流程认可新 hooks；本机已实际收到运�
 
 DSH 需要走 [原生插件安装流程](adapters/dsh/README.md)，普通依赖安装不能代替 manifest、版本和 patch 校验。Codex 服务桥可用 `python3 adapters/codex_status.py --once` 检查；没有受支持的运行中 daemon 时会退出，不创建服务或打开未知 socket。
 
+Antigravity 的安装与范围见 [ANTIGRAVITY.md](adapters/ANTIGRAVITY.md)，新版 Devin Local 见 [DEVIN-LOCAL.md](adapters/DEVIN-LOCAL.md)。两者与旧 Cascade 使用独立桥。Devin 默认导入 Claude 配置；Claude 观察命令按 Devin 的运行时环境标记跳过导入调用，避免把同一会话归到 Claude。
+
 ## 隐私和状态协议
 
 事件目录为 `~/Library/Application Support/Agent Watch/events/`，只接收受控元数据，目录0700、文件0600。没有云端账号、遥测或模型调用。hooks 输入会在内存中解析，仅保留会话/轮次/事件元数据；不会保存 prompt、工具参数或对话正文。
@@ -73,7 +75,7 @@ DSH 需要走 [原生插件安装流程](adapters/dsh/README.md)，普通依赖�
 
 Agent Watch is a local-first macOS agent monitor. Version 0.2.1 is a preview with a menu-bar dashboard, a persistent session state machine, metadata-only hook ingestion, conservative window inference, notifications, and local status export.
 
-**It has not passed end-to-end acceptance for all eight desktop products.** Claude Code activity and Codex activity/turn-end events have been observed live. Other integrations are explicitly marked as installed, fixture-tested, inferred, blocked, or unverified in the matrix above. CLI support never implies desktop support. Hidden conversations are not guaranteed by window observation.
+**It has not passed end-to-end acceptance for all eight desktop products.** Claude Code, Codex, DSH and WorkBuddy activity/turn-end paths have been observed live. Antigravity 2.28.2 also passed a real question-and-answer lifecycle, while its native cancellation callback was not observed. Other integrations are explicitly marked as installed, fixture-tested, inferred, blocked, or unverified in the matrix above. CLI support never implies desktop support. Hidden conversations are not guaranteed by window observation.
 
 Build with Swift 6 using `bash scripts/build-monitor.sh`, and check with `bash scripts/check.sh`. No third-party Swift package is required. Python 3 is used for hook bridges; Node.js is used for the DSH plugin checks. Existing access settings are not bypassed. See adapter documentation before enabling a source.
 

@@ -22,7 +22,8 @@ APP_LABEL = "Antigravity desktop"
 HOOK_GROUP_BASE = "agent-watch-antigravity"
 OWNER_OPTION = "--agent-watch-owner"
 OWNER_PREFIX = "antigravity-v1:"
-HOOK_EVENTS = ("PreInvocation", "Stop")
+HOOK_EVENTS = ("PreInvocation", "Stop", "PreToolUse", "PostToolUse")
+TOOL_EVENTS = frozenset({"PreToolUse", "PostToolUse"})
 HOOK_TIMEOUT_SECONDS = 1
 SCRIPT_NAME = "antigravity.py"
 BRIDGE_OWNER_MARKER = b"# agent-watch-bridge-owner: antigravity-v1"
@@ -141,8 +142,14 @@ def has_owned_handler(group: Any) -> bool:
         return False
     for event_name in HOOK_EVENTS:
         handlers = group.get(event_name)
-        if isinstance(handlers, list) and any(handler_is_owned(handler) for handler in handlers):
-            return True
+        if isinstance(handlers, list):
+            for handler in handlers:
+                if handler_is_owned(handler):
+                    return True
+                if event_name in TOOL_EVENTS and isinstance(handler, dict):
+                    nested = handler.get("hooks")
+                    if isinstance(nested, list) and any(handler_is_owned(item) for item in nested):
+                        return True
     return False
 
 
@@ -171,9 +178,17 @@ def remove_owned_handlers(document: dict[str, Any]) -> int:
             for handler in handlers:
                 if handler_is_owned(handler):
                     removed += 1
+                elif event_name in TOOL_EVENTS and isinstance(handler, dict) and isinstance(handler.get("hooks"), list):
+                    nested = handler["hooks"]
+                    remaining = [item for item in nested if not handler_is_owned(item)]
+                    removed += len(nested) - len(remaining)
+                    if len(remaining) == len(nested):
+                        kept.append(handler)
+                    elif remaining or set(handler).difference({"matcher", "hooks"}):
+                        kept.append({**handler, "hooks": remaining})
                 else:
                     kept.append(handler)
-            if len(kept) != len(handlers):
+            if kept != handlers:
                 group[event_name] = kept
     return removed
 
@@ -199,7 +214,11 @@ def install_handlers(
         if not isinstance(handlers, list):
             raise ValueError(f"{event_name} hooks must be a JSON array")
         command = command_for(event_name, script_path, python_executable, script_digest)
-        handlers.append(handler_for(command))
+        handler = handler_for(command)
+        if event_name in TOOL_EVENTS:
+            handlers.append({"matcher": "^ask_question$", "hooks": [handler]})
+        else:
+            handlers.append(handler)
         added += 1
     return group_name, added, removed
 

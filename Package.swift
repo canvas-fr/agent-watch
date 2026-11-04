@@ -13,6 +13,6 @@ let package = Package(
         .executableTarget(name: "AgentWatchProbe"),
         .target(name: "AgentWatchCore"),
         .executableTarget(name: "AgentWatchMonitor", dependencies: ["AgentWatchCore"]),
-        .executableTarget(name: "CoreChecks", dependencies: ["AgentWatchCore"], path: "Tests", exclude: ["ProbeChecks.swift", "WindowRuleChecks.swift", "StatusSummaryChecks.swift", "check_hooks.py", "check_cli.py", "check_inbox.swift", "check_devin.py", "check_antigravity.py"], sources: ["CoreChecks.swift"])
+        .executableTarget(name: "CoreChecks", dependencies: ["AgentWatchCore"], path: "Tests", exclude: ["ProbeChecks.swift", "WindowRuleChecks.swift", "StatusSummaryChecks.swift", "check_hooks.py", "check_cli.py", "check_inbox.swift", "check_devin.py", "check_devin_local.py", "check_antigravity.py"], sources: ["CoreChecks.swift"])
     ]
 )

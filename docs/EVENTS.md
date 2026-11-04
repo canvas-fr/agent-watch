@@ -23,4 +23,4 @@ Sources with independent counters have independent sequence domains. Codex hooks
 
 The native window adapter is experimental. It emits only inferred running, waitingApproval, and unknown. It never emits responseEnded merely because a stop button disappears. It does not guarantee access to hidden conversations.
 
-Local metadata and state are stored under the user's Application Support folder. The app provides an explicit local export; no data is uploaded. The three hook adapters are installed independently and preserve unrelated host configuration. The DSH plugin must pass its native bundle installer.
+Local metadata and state are stored under the user's Application Support folder. The app provides an explicit local export; no data is uploaded. The host-specific hook adapters are installed independently and preserve unrelated host configuration. The DSH plugin must pass its native bundle installer.
