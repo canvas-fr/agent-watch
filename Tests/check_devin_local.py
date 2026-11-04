@@ -8,6 +8,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 import runpy
 import shlex
+import shutil
 import stat
 import subprocess
 import sys
@@ -109,13 +110,27 @@ def check_metadata_projection() -> None:
         running_after_tool = ADAPTER["process_payload"](
             payload("PostToolUse"), home, FIXED_TIME.replace(microsecond=679076)
         )
-        ended = ADAPTER["process_payload"](
+        stop_intent = ADAPTER["process_payload"](
             payload("Stop"), home, FIXED_TIME.replace(microsecond=679101)
         )
-        assert ended is not None and ended["state"] == "responseEnded"
+        assert stop_intent is not None and stop_intent["state"] == "unknown"
+        assert stop_intent["evidence"] == "explicit"
+        assert stop_intent["source"] == "devin_local:Stop:awaiting_confirmation"
         assert running_before_tool is not None and running_before_tool["state"] == "running"
         assert running_after_tool is not None and running_after_tool["state"] == "running"
-        assert len(all_events(home)) == 5
+        running_after_stop = ADAPTER["process_payload"](
+            payload("PreToolUse"), home, FIXED_TIME.replace(microsecond=679151)
+        )
+        waiting_after_stop = ADAPTER["process_payload"](
+            payload("PermissionRequest"), home, FIXED_TIME.replace(microsecond=679176)
+        )
+        running_after_permission = ADAPTER["process_payload"](
+            payload("PreToolUse"), home, FIXED_TIME.replace(microsecond=679201)
+        )
+        assert running_after_stop is not None and running_after_stop["state"] == "running"
+        assert waiting_after_stop is not None and waiting_after_stop["state"] == "waitingApproval"
+        assert running_after_permission is not None and running_after_permission["state"] == "running"
+        assert len(all_events(home)) == 8
 
         persisted = "\n".join(path.read_text(encoding="utf-8") for path in event_directory(home).glob("*.json"))
         for forbidden in (
@@ -139,6 +154,11 @@ def check_event_contract_boundaries_and_silent_failure() -> None:
     assert event_for(payload("SessionEnd"), FIXED_TIME) is None
     assert event_for(payload("PreToolUse"), FIXED_TIME)["state"] == "running"
     assert event_for(payload("PostToolUse"), FIXED_TIME)["state"] == "running"
+    stop_intent = event_for(payload("Stop"), FIXED_TIME)
+    assert stop_intent is not None
+    assert stop_intent["state"] == "unknown"
+    assert stop_intent["evidence"] == "explicit"
+    assert stop_intent["source"] == "devin_local:Stop:awaiting_confirmation"
     assert event_for(payload("UserPromptSubmit", session="", turn="prompt-001"), FIXED_TIME) is None
     assert event_for(payload("UserPromptSubmit", session="session-001", turn=""), FIXED_TIME) is None
     assert event_for(payload("UserPromptSubmit", session="x" * 257), FIXED_TIME) is None
@@ -207,6 +227,105 @@ def check_event_contract_boundaries_and_silent_failure() -> None:
         except ValueError:
             pass
         assert oversized_stream.calls == 1, "oversized input must fail open without draining stdin"
+
+
+def check_stop_intent_and_same_turn_recovery_in_core() -> None:
+    swiftc = shutil.which("swiftc")
+    assert swiftc is not None, "swiftc is required to verify Devin Local events against SessionStore"
+
+    event_times = [
+        FIXED_TIME.replace(microsecond=0).replace(second=second)
+        for second in (46, 47, 48, 49)
+    ]
+    event_names = ("Stop", "PreToolUse", "PermissionRequest", "PreToolUse")
+    events = [
+        ADAPTER["event_for"](payload(event_name), observed_at)
+        for event_name, observed_at in zip(event_names, event_times)
+    ]
+    assert all(event is not None for event in events)
+    assert events[0]["state"] == "unknown"
+    assert events[0]["evidence"] == "explicit"
+    assert events[0]["source"] == "devin_local:Stop:awaiting_confirmation"
+
+    harness_source = r'''import Foundation
+
+@main
+struct DevinStopRecoveryCheck {
+    static func main() throws {
+        let input = FileHandle.standardInput.readDataToEndOfFile()
+        let decoder = JSONDecoder()
+        decoder.dateDecodingStrategy = .custom { decoder in
+            let container = try decoder.singleValueContainer()
+            let value = try container.decode(String.self)
+            let formatter = ISO8601DateFormatter()
+            formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+            guard let date = formatter.date(from: value) else {
+                throw DecodingError.dataCorruptedError(in: container, debugDescription: "invalid event time")
+            }
+            return date
+        }
+
+        let events = try decoder.decode([MonitorEvent].self, from: input)
+        let expectedStates: [SessionState] = [.unknown, .running, .waitingApproval, .running]
+        guard events.count == expectedStates.count else {
+            throw CheckFailure.message("unexpected Devin Local fixture count")
+        }
+
+        var store = SessionStore()
+        for (event, expectedState) in zip(events, expectedStates) {
+            _ = store.apply(event, now: event.observedAt)
+            guard let snapshot = store.sessions.first,
+                  snapshot.turnID == "prompt-001",
+                  snapshot.state == expectedState else {
+                throw CheckFailure.message("same-turn Devin Local state did not recover after Stop intent")
+            }
+        }
+        guard store.sessions.first?.source == "devin_local:PreToolUse" else {
+            throw CheckFailure.message("latest same-turn activity did not become the core snapshot source")
+        }
+        print("PASS: Stop intent stays nonterminal; PreToolUse and PermissionRequest recover in the same turn")
+    }
+}
+
+enum CheckFailure: Error {
+    case message(String)
+}
+'''
+
+    with tempfile.TemporaryDirectory(prefix="Agent Watch Devin Local core ") as temporary_root:
+        root = Path(temporary_root)
+        harness = root / "stop_recovery.swift"
+        binary = root / "stop_recovery"
+        harness.write_text(harness_source, encoding="utf-8")
+        compile_result = subprocess.run(
+            [
+                swiftc,
+                "-swift-version",
+                "6",
+                "-parse-as-library",
+                str(PROJECT_ROOT / "Sources" / "AgentWatchCore" / "SessionStore.swift"),
+                str(harness),
+                "-o",
+                str(binary),
+            ],
+            capture_output=True,
+            text=True,
+            timeout=60,
+            check=False,
+        )
+        assert compile_result.returncode == 0, compile_result.stderr
+
+        core_result = subprocess.run(
+            [str(binary)],
+            input=json.dumps(events),
+            capture_output=True,
+            text=True,
+            timeout=15,
+            check=False,
+        )
+        assert core_result.returncode == 0, core_result.stderr
+        assert "same-turn state did not recover" not in core_result.stderr
+        assert "PASS: Stop intent stays nonterminal" in core_result.stdout
 
 
 def check_installer_dry_run_apply_idempotency_and_uninstall() -> None:
@@ -357,6 +476,7 @@ def check_owned_bridge_can_be_updated() -> None:
 def main() -> None:
     check_metadata_projection()
     check_event_contract_boundaries_and_silent_failure()
+    check_stop_intent_and_same_turn_recovery_in_core()
     check_installer_dry_run_apply_idempotency_and_uninstall()
     check_jsonc_refusal_is_read_only()
     check_non_json_constants_are_refused()

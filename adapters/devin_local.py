@@ -23,8 +23,9 @@ HOOK_STATES = {
     "PermissionRequest": "waitingApproval",
     "PreToolUse": "running",
     "PostToolUse": "running",
-    "Stop": "responseEnded",
+    "Stop": "unknown",
 }
+STOP_INTENT_SOURCE = "devin_local:Stop:awaiting_confirmation"
 ALLOWED_FIELDS = frozenset({"hook_event_name", "session_id", "prompt_id"})
 JSON_PRIMITIVE = re.compile(
     rb"(?:true|false|null|-?(?:0|[1-9][0-9]*)(?:\.[0-9]+)?(?:[eE][+-]?[0-9]+)?)"
@@ -75,6 +76,7 @@ def event_for(payload: Any, observed_at: datetime | None = None) -> dict[str, An
     source_time = receipt_timestamp(observed_at)
     event_key = "\0".join((APP_ID, hook_name, session_id, turn_id, source_time))
     event_id = hashlib.sha256(event_key.encode("utf-8")).hexdigest()
+    source = STOP_INTENT_SOURCE if hook_name == "Stop" else f"devin_local:{hook_name}"
     return {
         "id": event_id,
         "appID": APP_ID,
@@ -83,7 +85,7 @@ def event_for(payload: Any, observed_at: datetime | None = None) -> dict[str, An
         "state": state,
         "evidence": "explicit",
         "observedAt": source_time,
-        "source": f"devin_local:{hook_name}",
+        "source": source,
     }
 
 

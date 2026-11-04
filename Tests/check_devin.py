@@ -84,14 +84,16 @@ def check_metadata_projection() -> None:
         assert repeated == projected
         assert len(all_events(home)) == 1, "replayed lifecycle hook should have a stable event ID"
 
-        completed = payload("post_cascade_response")
-        completed["tool_info"] = {
+        response_observed = payload("post_cascade_response")
+        response_observed["tool_info"] = {
             "response": "PRIVATE CASCADE RESPONSE MUST NOT BE SAVED",
             "command": "private command text",
         }
-        result = ADAPTER["process_payload"](completed, home)
+        result = ADAPTER["process_payload"](response_observed, home)
         assert result is not None
-        assert result["state"] == "responseEnded"
+        assert result["state"] == "unknown"
+        assert result["evidence"] == "explicit"
+        assert result["source"] == "devin:post_cascade_response:awaiting_confirmation"
         assert result["turnID"] == projected["turnID"], "execution_id must correlate both lifecycle events"
         assert result["sequence"] == 2
         assert len(all_events(home)) == 2
@@ -120,6 +122,11 @@ def check_event_contract_boundaries() -> None:
     event_for = ADAPTER["event_for"]
     assert event_for(payload("post_user_prompt")) is None
     assert event_for(payload("post_cascade_response_with_transcript")) is None
+    response_observed = event_for(payload("post_cascade_response"))
+    assert response_observed is not None
+    assert response_observed["state"] == "unknown"
+    assert response_observed["evidence"] == "explicit"
+    assert response_observed["source"] == "devin:post_cascade_response:awaiting_confirmation"
     assert event_for({"hook_event_name": "UserPromptSubmit", "session_id": "cli-session", "prompt_id": "cli-turn"}) is None
     assert event_for(payload("pre_user_prompt", session="", turn="execution-001")) is None
     assert event_for(payload("pre_user_prompt", session="trajectory-001", turn="")) is None

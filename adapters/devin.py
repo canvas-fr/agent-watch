@@ -18,8 +18,9 @@ APP_ID = "devin"
 MAX_INPUT_BYTES = 1024 * 1024
 HOOK_STATES = {
     "pre_user_prompt": ("running", 1),
-    "post_cascade_response": ("responseEnded", 2),
+    "post_cascade_response": ("unknown", 2),
 }
+RESPONSE_CONFIRMATION_SOURCE = "devin:post_cascade_response:awaiting_confirmation"
 
 
 def private_root(home: Path) -> Path:
@@ -67,6 +68,11 @@ def event_for(payload: Any) -> dict[str, Any] | None:
     state, sequence = mapped
     event_key = "\0".join((APP_ID, action, session_id, turn_id, observed_at))
     event_id = hashlib.sha256(event_key.encode("utf-8")).hexdigest()
+    source = (
+        RESPONSE_CONFIRMATION_SOURCE
+        if action == "post_cascade_response"
+        else f"{APP_ID}:{action}"
+    )
     return {
         "id": event_id,
         "appID": APP_ID,
@@ -76,7 +82,7 @@ def event_for(payload: Any) -> dict[str, Any] | None:
         "evidence": "explicit",
         "observedAt": observed_at,
         "sequence": sequence,
-        "source": f"{APP_ID}:{action}",
+        "source": source,
     }
 
 
