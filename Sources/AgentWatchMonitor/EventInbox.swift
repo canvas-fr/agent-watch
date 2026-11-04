@@ -10,7 +10,24 @@ struct CollectionBatch: Sendable {
 
 actor WindowCollector {
     private let adapter = WindowAdapter()
-    func collect() -> WindowScan { adapter.scan(targets: liveApps.map(\.target)) }
+    private let claude = ClaudeChatAdapter()
+    private let claudeCancellation = ClaudeCancellationBridge()
+    func collect() -> WindowScan {
+        let targets = liveApps.compactMap { app -> WindowTarget? in
+            // These clients have durable session identities. An anonymous AX
+            // window would count the same task twice. Ordinary ChatGPT keeps
+            // its own fallback because Codex journals do not describe it.
+            if ["gemini", "claude"].contains(app.id) { return nil }
+            let identities = app.id == "codex" ? app.bundleIDs.filter { $0 != "com.openai.codex" } : app.bundleIDs
+            return WindowTarget(appID: app.id, bundleIDs: identities)
+        }
+        let windows = adapter.scan(targets: targets)
+        let scope = claude.scan()
+        var health = windows.diagnostics
+        health["claude_scope"] = scope.diagnostics["claude_code"]
+        health.merge(scope.diagnostics) { _, new in new }
+        return WindowScan(events: windows.events + claudeCancellation.apply(scope), diagnostics: health)
+    }
 }
 
 actor MonitorCollector {
@@ -114,7 +131,7 @@ actor MonitorCollector {
                 // Offline observations still carry useful terminal facts. The
                 // state engine and notification freshness checks handle age;
                 // do not silently discard valid buffered events after an hour.
-                events.append(event)
+                events.append(normalizeLifecycleEvidence(event))
                 consumed.append(file)
             }
         }
@@ -140,4 +157,17 @@ actor MonitorCollector {
             !$0.isEmpty && $0.utf8.count <= 256 && !$0.contains(where: \.isNewline)
         }
     }
+}
+
+/// Legacy Stop observers report intent before the host has decided whether to
+/// continue. Durable lifecycle records are the confirmation source.
+func normalizeLifecycleEvidence(_ event: MonitorEvent) -> MonitorEvent {
+    guard event.state == .responseEnded,
+          ["codex", "claude_code"].contains(event.appID),
+          [event.appID + ":Stop", event.appID + ":SubagentStop"].contains(event.source) else { return event }
+    return MonitorEvent(id: event.id, appID: event.appID, sessionID: event.sessionID,
+                        turnID: event.turnID, state: .unknown, evidence: event.evidence,
+                        observedAt: event.observedAt, sequence: event.sequence,
+                        parentSessionID: event.parentSessionID,
+                        source: event.source + ":awaiting_confirmation")
 }

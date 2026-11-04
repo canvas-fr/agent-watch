@@ -6,7 +6,64 @@ struct InboxChecks {
     static func main() async throws {
         try await badFilesDoNotStarveLaterEvents()
         try await validEventBatchIsBounded()
+        try stopIntentDoesNotLockTheTurn()
+        try coworkCancellationRequiresTheObservedAuditTurn()
         print("PASS: inbox scan bounds, cursor fairness, and acknowledgement boundary")
+    }
+
+    private static func coworkCancellationRequiresTheObservedAuditTurn() throws {
+        let start = Date(timeIntervalSince1970: 10_000)
+        var current = ClaudeActiveAuditTurn(sessionID: "canonical-session", turnID: "old-turn", observedAt: start.addingTimeInterval(-1))
+        let bridge = ClaudeCancellationBridge(resolve: { _ in current })
+        func scan(_ state: SessionState, kind: ClaudeChatRouteKind = .cowork) -> ClaudeChatAdapterScan {
+            ClaudeChatAdapterScan(observations: [ClaudeChatWindowObservation(
+                windowFingerprint: "window", routeSessionID: "local_00000000-0000-4000-8000-000000000001",
+                routeKind: kind, sessionFingerprint: "route-hash", scope: .cowork,
+                state: state)], diagnostics: [:])
+        }
+        try expect(bridge.apply(scan(.cancelled), now: start).isEmpty, "cold interruption has no active audit identity")
+        _ = bridge.apply(scan(.running), now: start)
+        try expect(bridge.apply(scan(.cancelled), now: start.addingTimeInterval(1)).isEmpty,
+                   "an old audit cursor cannot identify a newly observed native run")
+        _ = bridge.apply(scan(.running), now: start.addingTimeInterval(2))
+        current = ClaudeActiveAuditTurn(sessionID: "canonical-session", turnID: "actual-turn", observedAt: start.addingTimeInterval(3))
+        _ = bridge.apply(scan(.running), now: start.addingTimeInterval(3))
+        let cancelled = bridge.apply(scan(.cancelled), now: start.addingTimeInterval(4))
+        try expect(cancelled.count == 1 && cancelled.first?.turnID == "actual-turn"
+                   && cancelled.first?.state == .cancelled, "a continuous Cowork interruption closes only its observed audit turn")
+        try expect(bridge.apply(scan(.cancelled), now: start.addingTimeInterval(5)).isEmpty,
+                   "one native interruption emits only once")
+        _ = bridge.apply(scan(.running), now: start.addingTimeInterval(6))
+        current = ClaudeActiveAuditTurn(sessionID: "canonical-session", turnID: "another-turn", observedAt: start.addingTimeInterval(7))
+        try expect(bridge.apply(scan(.cancelled), now: start.addingTimeInterval(7)).isEmpty,
+                   "a changed audit turn cannot inherit an earlier window witness")
+        _ = bridge.apply(scan(.running, kind: .code), now: start.addingTimeInterval(8))
+        try expect(bridge.apply(scan(.cancelled, kind: .code), now: start.addingTimeInterval(9)).isEmpty,
+                   "Cowork interruption rules never classify Claude Code cancellation")
+    }
+
+    private static func stopIntentDoesNotLockTheTurn() throws {
+        var store = SessionStore()
+        let now = Date()
+        let make = { (identifier: String, state: SessionState, source: String, seconds: Double) in
+            MonitorEvent(id: identifier, appID: "codex", sessionID: "thread", turnID: "turn",
+                         state: state, evidence: .explicit, observedAt: now.addingTimeInterval(seconds),
+                         source: source)
+        }
+        _ = store.apply(make("start", .running, "codex:PreToolUse", 0), now: now)
+        let stop = normalizeLifecycleEvidence(make("intent", .responseEnded, "codex:Stop", 1))
+        try expect(stop.state == .unknown, "Stop is not durable completion")
+        try expect(store.apply(stop, now: now.addingTimeInterval(1)) == nil, "stop intent does not notify completion")
+        _ = store.apply(make("continue", .running, "codex:PreToolUse", 2), now: now.addingTimeInterval(2))
+        try expect(store.sessions.first?.state == .running, "a blocked Stop can continue in the same turn")
+        let end = normalizeLifecycleEvidence(make("complete", .responseEnded, "codex_rollout:task_complete", 3))
+        try expect(store.apply(end, now: now.addingTimeInterval(3))?.state == .responseEnded,
+                   "durable TurnComplete closes and notifies the actual turn")
+        let claudeStop = MonitorEvent(id: "claude-stop-intent", appID: "claude_code",
+            sessionID: "claude-session", turnID: "claude-turn", state: .responseEnded,
+            evidence: .explicit, observedAt: now, source: "claude_code:Stop")
+        try expect(normalizeLifecycleEvidence(claudeStop).state == .unknown,
+                   "Claude Stop can also be blocked by a later hook")
     }
 
     private static func badFilesDoNotStarveLaterEvents() async throws {

@@ -1,0 +1,12 @@
+{
+  "groupRole": "AXGroup",
+  "headingRole": "AXHeading",
+  "heading": "New session",
+  "statusRoles": ["AXStaticText", "AXStaticText"],
+  "statusTexts": [
+    "Couldn’t sign in to Gateway",
+    "The provider rejected your credentials. Re-enter them in Setup."
+  ],
+  "buttonRole": "AXButton",
+  "buttons": ["Details", "Open Setup", "Check again", "Dismiss"]
+}

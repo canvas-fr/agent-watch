@@ -40,6 +40,11 @@ struct StatusSummaryChecks {
         inbox.record(appID: "beta", sessionID: "session-2", turnID: "turn-1")
         inbox.record(appID: "alpha", sessionID: "session-3", turnID: "turn-2")
 
+        inbox.remove(appID: "alpha", sessionID: "session-1", turnID: "turn-1")
+        expect(inbox.count == 2 && inbox.appIDs == ["beta", "alpha"], "removing one exact receipt preserves other turns")
+        inbox.record(appID: "alpha", sessionID: "session-1", turnID: "turn-1")
+        expect(inbox.count == 3, "an exact receipt can be restored without replacing unrelated completions")
+
         inbox.remove(appID: "alpha")
         expect(inbox.count == 1 && inbox.appIDs == ["beta"], "removing one app clears only its records")
 

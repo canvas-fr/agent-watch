@@ -1,0 +1,3 @@
+{"type":"user","uuid":"fixture-user-1","session_id":"fixture-cli","parent_tool_use_id":null,"message":{"role":"user","content":"SYNTHETIC_PROMPT_DO_NOT_CAPTURE"},"_audit_timestamp":"2026-11-04T00:00:01.000Z"}
+{"type":"system","subtype":"init","session_id":"fixture-cli","tools":["Read","Bash"],"_audit_timestamp":"2026-11-04T00:00:02.000Z"}
+{"type":"system","subtype":"permission_request","uuid":"fixture-request-1","session_id":"fixture-cli","tool_name":"Bash","tool_input":{"command":"SYNTHETIC_INPUT_DO_NOT_CAPTURE"},"_audit_timestamp":"2026-11-04T00:00:03.000Z"}

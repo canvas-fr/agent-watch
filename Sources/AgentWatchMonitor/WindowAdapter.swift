@@ -40,6 +40,9 @@ public final class WindowAdapter: @unchecked Sendable {
     private let queue = DispatchQueue(label: "com.agentwatch.window-adapter.ax", qos: .utility)
     private var windowStates: [WindowKey: WindowState] = [:]
     private var targetRotator = WindowTargetRotator()
+    private var compatibilityDiagnostics: [Int32: String] = [:]
+    private var windowScanOffsets: [Int32: Int] = [:]
+    private var knownWindowKeys: [Int32: [(AXUIElement, WindowKey)]] = [:]
 
     public init() {}
 
@@ -105,19 +108,35 @@ public final class WindowAdapter: @unchecked Sendable {
                     appComplete = false
                     break
                 }
+                if target.appID == "doubao" {
+                    let compatibility = ChromiumAccessibilityCompatibility.enableWebAccessibility(
+                        pid: runningApplication.processIdentifier,
+                        bundleIdentifier: runningApplication.bundleIdentifier
+                    )
+                    if compatibility != .alreadyAttempted {
+                        compatibilityDiagnostics[runningApplication.processIdentifier] = compatibility.rawValue
+                    }
+                    diagnostics["doubao_compatibility_\(runningApplication.processIdentifier)"] = compatibilityDiagnostics[runningApplication.processIdentifier]
+                    if compatibility == .ignoredNotWhitelisted || compatibility == .processUnavailable { continue }
+                }
                 let result = inspectProcess(
                     pid: runningApplication.processIdentifier,
                     appID: target.appID,
+                    bundleIdentifier: runningApplication.bundleIdentifier,
                     deadline: appDeadline,
                     remainingNodes: &remainingNodes
                 )
                 observations.append(contentsOf: result.windows)
                 appComplete = appComplete && result.complete
+                diagnostics["\(target.appID)_process_\(runningApplication.processIdentifier)"] =
+                    "windows=\(result.windows.count),nodes=\(result.nodes),webAreas=\(result.webAreas),complete=\(result.complete)" + (result.discovery.map { ",roots=\($0)" } ?? "")
             }
 
             let seenKeys = Set(observations.map(\.key))
             for observation in observations {
-                let collectionComplete = appComplete && observation.treeComplete
+                // An unreadable popup cannot invalidate a separately observed
+                // complete main window in the same application.
+                let collectionComplete = observation.treeComplete
                 let input = WindowRuleInput(
                     controls: observation.controls,
                     dialogControls: observation.dialogControls,
@@ -189,6 +208,7 @@ public final class WindowAdapter: @unchecked Sendable {
     private func inspectProcess(
         pid: Int32,
         appID: String,
+        bundleIdentifier: String?,
         deadline: TimeInterval,
         remainingNodes: inout Int
     ) -> ProcessObservation {
@@ -203,53 +223,64 @@ public final class WindowAdapter: @unchecked Sendable {
             kAXWindowsAttribute as CFString,
             &windowCount
         )
-        guard countResult == .success, windowCount >= 0 else {
-            return ProcessObservation(windows: [], complete: false)
+        var roots: [AXUIElement] = []
+        var discoveryStatus: String?
+        var complete = countResult == .success && windowCount >= 0
+        if complete && windowCount > 0 {
+            let count = min(windowCount, WindowLimits.maximumWindowsPerProcess)
+            complete = count == windowCount
+            var copied: CFArray?
+            let result = AXUIElementCopyAttributeValues(application, kAXWindowsAttribute as CFString, 0, count, &copied)
+            if result == .success, let copied {
+                for index in 0..<CFArrayGetCount(copied) {
+                    guard let pointer = CFArrayGetValueAtIndex(copied, index) else { complete = false; continue }
+                    let reference = Unmanaged<CFTypeRef>.fromOpaque(pointer).takeUnretainedValue()
+                    guard CFGetTypeID(reference) == AXUIElementGetTypeID() else { complete = false; continue }
+                    roots.append(Unmanaged<AXUIElement>.fromOpaque(pointer).takeUnretainedValue())
+                }
+                complete = complete && roots.count == count
+            } else { complete = false }
         }
-        guard windowCount > 0 else {
-            return ProcessObservation(windows: [], complete: true)
+        if roots.isEmpty && ["doubao", "devin"].contains(appID) {
+            let discovery = WindowIdentity.discoverVerifiedTargetRoots(
+                appID: appID, pid: pid, bundleIdentifier: bundleIdentifier,
+                deadline: deadline, messageTimeout: WindowLimits.messageTimeout
+            )
+            roots = Array(discovery.roots.prefix(Int(WindowLimits.maximumWindowsPerProcess)))
+            discoveryStatus = discovery.status.rawValue + ":hits=\(discovery.hitTestCount):metadata=\(discovery.metadataWindowCount):matched=\(discovery.matchedWindowCount)"
+            complete = discovery.status == .rootsFound || discovery.status == .noRoots
         }
-        let inspectedWindowCount = min(windowCount, WindowLimits.maximumWindowsPerProcess)
-        var complete = inspectedWindowCount == windowCount
-
-        var copiedWindows: CFArray?
-        let windowsResult = AXUIElementCopyAttributeValues(
-            application,
-            kAXWindowsAttribute as CFString,
-            0,
-            inspectedWindowCount,
-            &copiedWindows
-        )
-        guard windowsResult == .success, let copiedWindows else {
-            return ProcessObservation(windows: [], complete: false)
+        guard !roots.isEmpty else {
+            if complete { knownWindowKeys.removeValue(forKey: pid) }
+            return ProcessObservation(windows: [], complete: complete, discovery: discoveryStatus)
         }
-
-        let arrayCount = CFArrayGetCount(copiedWindows)
-        guard arrayCount == inspectedWindowCount else {
-            return ProcessObservation(windows: [], complete: false)
+        if complete {
+            knownWindowKeys[pid] = knownWindowKeys[pid]?.filter { cached in roots.contains { CFEqual(cached.0, $0) } }
         }
 
         var observations: [WindowObservation] = []
-        for index in 0..<arrayCount {
-            guard systemUptime < deadline,
-                  let pointer = CFArrayGetValueAtIndex(copiedWindows, index) else {
+        var totalNodes = 0
+        var totalWebAreas = 0
+        let startIndex = (windowScanOffsets[pid] ?? 0) % roots.count
+        windowScanOffsets[pid] = (startIndex + 1) % roots.count
+        let orderedIndexes = Array(startIndex..<roots.count) + Array(0..<startIndex)
+        for index in orderedIndexes {
+            guard systemUptime < deadline else {
                 complete = false
                 break
             }
-            let reference = Unmanaged<CFTypeRef>.fromOpaque(pointer).takeUnretainedValue()
-            guard CFGetTypeID(reference) == AXUIElementGetTypeID() else {
-                complete = false
-                continue
-            }
-            let window = Unmanaged<AXUIElement>.fromOpaque(pointer).takeUnretainedValue()
+            let window = roots[index]
             let (possibleKey, identityComplete) = resolveWindowKey(
                 appID: appID,
                 pid: pid,
                 window: window,
-                singleWindow: windowCount == 1
+                singleWindow: roots.count == 1,
+                deadline: deadline
             )
             guard let key = possibleKey else { complete = false; continue }
             let tree = inspectWindow(window, deadline: deadline, remainingNodes: &remainingNodes)
+            totalNodes += tree.nodes
+            totalWebAreas += tree.webAreas
             complete = complete && identityComplete && tree.complete
             observations.append(WindowObservation(
                 key: key,
@@ -259,10 +290,10 @@ public final class WindowAdapter: @unchecked Sendable {
                 composerSend: tree.composerSend,
                 composerSpecificStop: tree.composerSpecificStop,
                 composerGenericStop: tree.composerGenericStop,
-                treeComplete: tree.complete
+                treeComplete: tree.complete && identityComplete
             ))
         }
-        return ProcessObservation(windows: observations, complete: complete)
+        return ProcessObservation(windows: observations, complete: complete, nodes: totalNodes, webAreas: totalWebAreas, discovery: discoveryStatus)
     }
 
     private func inspectWindow(
@@ -296,7 +327,9 @@ public final class WindowAdapter: @unchecked Sendable {
             composerSend: composerSend,
             composerSpecificStop: composerSpecificStop,
             composerGenericStop: composerGenericStop,
-            complete: complete && !collector.clipped
+            complete: complete && !collector.clipped,
+            nodes: collector.nodesVisited,
+            webAreas: collector.webAreas
         )
     }
 
@@ -323,6 +356,7 @@ public final class WindowAdapter: @unchecked Sendable {
         guard let role = readRole(from: element, collector: &collector) else {
             return false
         }
+        if role == "AXWebArea" { collector.webAreas += 1 }
         let opensDialog = role == "AXSheet" || role == "AXDialog"
         let dialogID = opensDialog ? nodeID : inheritedDialogID
         if opensDialog { collector.hasDialog = true }
@@ -444,11 +478,22 @@ public final class WindowAdapter: @unchecked Sendable {
         appID: String,
         pid: Int32,
         window: AXUIElement,
-        singleWindow: Bool
+        singleWindow: Bool,
+        deadline: TimeInterval
     ) -> (WindowKey?, Bool) {
         let (windowNumber, numberReadComplete) = readWindowNumber(from: window)
         if let windowNumber {
-            return (WindowKey(appID: appID, pid: pid, identity: "number:\(windowNumber)"), numberReadComplete)
+            let key = WindowKey(appID: appID, pid: pid, identity: "number:\(windowNumber)")
+            rememberWindowKey(key, window: window, pid: pid)
+            return (key, numberReadComplete)
+        }
+        if let number = WindowIdentity.resolveOSWindowNumber(pid: pid, axWindow: window, deadline: deadline) {
+            let key = WindowKey(appID: appID, pid: pid, identity: "number:\(number)")
+            rememberWindowKey(key, window: window, pid: pid)
+            return (key, true)
+        }
+        if let cached = knownWindowKeys[pid]?.first(where: { $0.1.appID == appID && CFEqual($0.0, window) }) {
+            return (cached.1, true)
         }
         // Some providers recreate AX references every scan. Do not turn those
         // transient references into a stream of imaginary sessions.
@@ -457,6 +502,13 @@ public final class WindowAdapter: @unchecked Sendable {
         }
         // Multiple windows without a stable OS ID cannot safely be distinguished.
         return (nil, false)
+    }
+
+    private func rememberWindowKey(_ key: WindowKey, window: AXUIElement, pid: Int32) {
+        var entries = knownWindowKeys[pid] ?? []
+        entries.removeAll { CFEqual($0.0, window) }
+        entries.append((window, key))
+        knownWindowKeys[pid] = Array(entries.suffix(32))
     }
 
     private func readWindowNumber(from window: AXUIElement) -> (Int?, Bool) {
@@ -492,6 +544,9 @@ public final class WindowAdapter: @unchecked Sendable {
 
     private func removeExitedProcesses(_ liveProcessIDs: Set<Int32>) {
         windowStates = windowStates.filter { liveProcessIDs.contains($0.key.pid) }
+        compatibilityDiagnostics = compatibilityDiagnostics.filter { liveProcessIDs.contains($0.key) }
+        windowScanOffsets = windowScanOffsets.filter { liveProcessIDs.contains($0.key) }
+        knownWindowKeys = knownWindowKeys.filter { liveProcessIDs.contains($0.key) }
     }
 
     private func breakMissingRunStreak(appID: String) {
@@ -606,6 +661,9 @@ struct WindowTurnCursor {
 private struct ProcessObservation {
     let windows: [WindowObservation]
     let complete: Bool
+    var nodes = 0
+    var webAreas = 0
+    var discovery: String?
 }
 
 private struct WindowObservation {
@@ -627,10 +685,13 @@ private struct TreeObservation {
     let composerSpecificStop: Bool
     let composerGenericStop: Bool
     let complete: Bool
+    var nodes = 0
+    var webAreas = 0
 }
 
 private struct TreeCollector {
     var nodesVisited = 0
+    var webAreas = 0
     var clipped = false
     var hasDialog = false
     var controls: Set<WindowControlSignal> = []

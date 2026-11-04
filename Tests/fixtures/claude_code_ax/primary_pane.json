@@ -1,0 +1,10 @@
+{
+  "groupRole": "AXGroup",
+  "description": "Primary pane",
+  "children": [
+    {"role": "AXStaticText", "value": "Claude finished the response"},
+    {"role": "AXGroup", "description": "Session chapters"},
+    {"role": "AXGroup", "description": "Chat messages"}
+  ],
+  "completionRule": "unknown_without_validated_running_transition"
+}

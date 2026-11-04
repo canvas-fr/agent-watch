@@ -39,6 +39,14 @@ public struct CompletionInbox: Codable, Sendable {
         entries.removeAll { $0.appID == appID }
     }
 
+    /// Removes one exact app, session, and turn receipt without clearing
+    /// unrelated completions from that app or other applications.
+    public mutating func remove(appID: String, sessionID: String, turnID: String) {
+        entries.removeAll {
+            $0.appID == appID && $0.sessionID == sessionID && $0.turnID == turnID
+        }
+    }
+
     /// Number of unread completion records.
     public var count: Int {
         entries.count

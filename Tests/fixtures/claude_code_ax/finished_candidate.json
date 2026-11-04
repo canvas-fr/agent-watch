@@ -1,0 +1,10 @@
+{
+  "layout": "primaryPane",
+  "route": "app://localhost/epitaxy/local_01234567-89ab-cdef-0123-456789abcdef",
+  "statusLabel": "Claude finished the response",
+  "stopButtonVisible": false,
+  "needsInputTextCount": 0,
+  "optionToggleCount": 0,
+  "questionActionLabels": [],
+  "latestAssistantCopyVisible": true
+}

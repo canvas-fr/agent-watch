@@ -21,6 +21,12 @@ struct AgentWatchMonitorApp: App {
 struct MenuPanel: View {
     @ObservedObject var monitor: MonitorModel
     @Environment(\.openWindow) private var openWindow
+    private var recentSessions: [SessionSnapshot] {
+        Array(monitor.sessions.filter { !$0.stale && $0.state != .unknown }.sorted {
+            if $0.state.needsAttention != $1.state.needsAttention { return $0.state.needsAttention }
+            return $0.updatedAt > $1.updatedAt
+        }.prefix(8))
+    }
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
             Text("Agent Watch").font(.headline)
@@ -29,10 +35,19 @@ struct MenuPanel: View {
                 Text("\(monitor.completionCount) 个新结束轮次")
                 Button("已看过结束提醒") { monitor.markCompletionsRead() }
             }
-            ForEach(Array(monitor.sessions.filter { $0.state.needsAttention }.prefix(5))) { session in
-                Button("\(appName(session.appID)) · \(session.state.label)") { monitor.openApp(session.appID) }
+            ForEach(recentSessions) { session in
+                HStack {
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text(appName(session.appID) + " · " + session.state.label).font(.caption)
+                        Text(monitor.stateSince[session.id] ?? session.updatedAt, style: .relative)
+                            .font(.caption2).foregroundStyle(.secondary)
+                    }
+                    Spacer()
+                    Button("打开应用") { monitor.openApp(session.appID) }.disabled(session.appID == "demo")
+                }
             }
             Button("打开监控面板") { openWindow(id: "dashboard"); NSApp.activate(ignoringOtherApps: true) }
+            Button("显示悬浮小面板") { monitor.showFloatingPanel() }
             Button(monitor.paused ? "继续监控" : "暂停监控") { monitor.paused.toggle() }
             Divider()
             Button("退出 Agent Watch") { NSApp.terminate(nil) }
@@ -56,6 +71,7 @@ struct MonitorDashboard: View {
                 Spacer()
                 if monitor.demo { Text("含演示数据").foregroundStyle(.orange).bold() }
                 Button(monitor.paused ? "继续" : "暂停") { monitor.paused.toggle() }
+                Button("悬浮小面板") { monitor.showFloatingPanel() }
                 Toggle("置顶", isOn: $pinned).toggleStyle(.switch).frame(width: 85)
                     .onChange(of: pinned) { _, value in NSApp.keyWindow?.level = value ? .floating : .normal }
             }
@@ -78,6 +94,9 @@ struct MonitorDashboard: View {
                             VStack(alignment: .leading, spacing: 4) {
                                 HStack { Button(app.name) { selected = app.id }; Spacer(); Circle().fill(monitor.runningApps.contains(app.id) ? Color.green : Color.gray).frame(width: 7, height: 7) }
                                 Text(app.capability).font(.caption2).foregroundStyle(.secondary)
+                                if let health = monitor.recordsHealth(for: app.id) {
+                                    Text(health).font(.caption).foregroundStyle(.secondary)
+                                }
                                 Text(monitor.sessions.contains(where: { app.contains($0.appID) && $0.evidence == .explicit && !$0.stale })
                                      ? "已收到近期会话事件" : monitor.runningApps.contains(app.id) ? diagnostic(monitor.diagnostics[app.id]) : "应用未运行").font(.caption).foregroundStyle(.secondary)
                             }.padding(8).background(selected == app.id ? Color.accentColor.opacity(0.10) : Color.clear).clipShape(RoundedRectangle(cornerRadius: 8))
@@ -119,9 +138,12 @@ struct MonitorDashboard: View {
                 Button("导出状态") { monitor.exportReport() }
                 Spacer()
                 Toggle("窗口观察", isOn: $monitor.windowObservation)
-                Toggle("推断提醒", isOn: $monitor.notifyInferred)
+                Toggle("其他推断提醒", isOn: $monitor.notifyInferred)
                 Button("演示") { showDemo.toggle() }
             }.font(.caption)
+            Toggle("Gemini 回复结束提醒（界面推断）", isOn: $monitor.notifyWindowCompletions)
+                .font(.caption)
+                .help("只在连续观察到运行和新回复的完整结束控件后提醒；不可观察时保持未知。")
             if showDemo {
                 HStack {
                     Text("仅测试面板和提醒：").font(.caption)
@@ -138,6 +160,7 @@ struct MonitorDashboard: View {
         guard let code else { return "等待采集" }
         if code.contains("permission") || code.contains("not_trusted") { return "需要辅助功能权限" }
         if code.contains("disabled") { return "窗口观察已关闭" }
+        if code.contains("unsupported") || code.contains("mismatch") { return "客户端版本或界面结构尚未验证" }
         if code.contains("budget") || code.contains("partial") { return "部分可读，状态未必可判定" }
         if code.contains("unavailable") || code.contains("error") { return "暂时无法读取窗口" }
         return "窗口观察中 · 任务信号待确认"

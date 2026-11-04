@@ -1,0 +1,2 @@
+{"type":"user","uuid":"fixture-chat-user-1","session_id":"fixture-chat-cli","parent_tool_use_id":null,"message":{"role":"user","content":"SYNTHETIC_CHAT_PROMPT_DO_NOT_CAPTURE"},"_audit_timestamp":"2026-11-04T00:00:01.000Z"}
+{"type":"result","subtype":"success","is_error":false,"result":"SYNTHETIC_CHAT_REPLY_DO_NOT_CAPTURE","session_id":"fixture-chat-cli","_audit_timestamp":"2026-11-04T00:00:02.000Z"}

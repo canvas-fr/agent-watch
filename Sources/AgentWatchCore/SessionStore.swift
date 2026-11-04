@@ -228,6 +228,52 @@ public struct SessionStore: Codable, Sendable {
         records = records.filter { $0.value.snapshot.evidence != .inferred }
     }
 
+    /// Reclassifies persisted terminal states produced by legacy Stop hooks.
+    /// Those hooks recorded stop intent, not a completed turn. Event IDs and
+    /// closed-turn history remain intact so replay cannot restore the false end.
+    public mutating func invalidatePrematureStopCompletions() -> [(appID: String, sessionID: String, turnID: String)] {
+        let stopSources: Set<String> = [
+            "codex:Stop",
+            "codex:SubagentStop",
+            "claude_code:Stop",
+            "claude_code:SubagentStop",
+        ]
+        let orderedKeys = records.keys.sorted {
+            if $0.appID != $1.appID { return $0.appID < $1.appID }
+            return $0.sessionID < $1.sessionID
+        }
+        var invalidated: [(appID: String, sessionID: String, turnID: String)] = []
+
+        for key in orderedKeys {
+            guard var record = records[key],
+                  record.snapshot.state == .responseEnded,
+                  stopSources.contains(record.snapshot.source) else {
+                continue
+            }
+
+            let previous = record.snapshot
+            invalidated.append((appID: previous.appID, sessionID: previous.sessionID, turnID: previous.turnID))
+            record.lastObservedState = .unknown
+            record.terminalState = nil
+            record.notifiedTerminalStates.remove(.responseEnded)
+            record.snapshot = SessionSnapshot(
+                appID: previous.appID,
+                sessionID: previous.sessionID,
+                turnID: previous.turnID,
+                state: .unknown,
+                evidence: previous.evidence,
+                updatedAt: previous.updatedAt,
+                source: previous.source + ":awaiting_confirmation",
+                parentSessionID: previous.parentSessionID,
+                stale: previous.stale
+            )
+            record.lastTouched = nextTouch()
+            records[key] = record
+        }
+
+        return invalidated
+    }
+
     public var sessions: [SessionSnapshot] {
         records.values.map(\.snapshot).sorted {
             if $0.updatedAt != $1.updatedAt {
@@ -290,7 +336,8 @@ public struct SessionStore: Codable, Sendable {
             if Self.terminalStates.contains(event.state) {
                 record.terminalState = event.state
             }
-            record.snapshot = Self.snapshot(for: event, stale: false)
+            record.snapshot = Self.snapshot(for: event, stale: false,
+                                            previousParentID: record.snapshot.parentSessionID)
             record.lastTouched = nextTouch()
             records[key] = record
 
@@ -360,7 +407,7 @@ public struct SessionStore: Codable, Sendable {
         }
     }
 
-    private static func snapshot(for event: MonitorEvent, stale: Bool) -> SessionSnapshot {
+    private static func snapshot(for event: MonitorEvent, stale: Bool, previousParentID: String? = nil) -> SessionSnapshot {
         SessionSnapshot(
             appID: event.appID,
             sessionID: event.sessionID,
@@ -369,7 +416,7 @@ public struct SessionStore: Codable, Sendable {
             evidence: event.evidence,
             updatedAt: event.observedAt,
             source: event.source,
-            parentSessionID: event.parentSessionID,
+            parentSessionID: event.parentSessionID ?? previousParentID,
             stale: stale
         )
     }

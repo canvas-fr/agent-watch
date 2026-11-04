@@ -13,6 +13,7 @@ final class MonitorModel: NSObject, ObservableObject, UNUserNotificationCenterDe
     @Published var paused = false
     @Published var windowObservation = true
     @Published var notifyInferred = false
+    @Published var notifyWindowCompletions = true
     @Published var notificationsEnabled = false
     @Published var statusMessage = "等待首次采集"
     @Published var recentNotices: [String] = []
@@ -25,6 +26,11 @@ final class MonitorModel: NSObject, ObservableObject, UNUserNotificationCenterDe
     private var task: Task<Void, Never>?
     private var windowTask: Task<Void, Never>?
     private let windowCollector = WindowCollector()
+    private var metadataTask: Task<Void, Never>?
+    private let metadataSources = MetadataSources()
+    private var geminiTask: Task<Void, Never>?
+    private let geminiCollector = GeminiCollector()
+    private let floatingPanel = FloatingPanelController()
     private var demoTurn = UUID().uuidString
 
     override init() {
@@ -42,6 +48,12 @@ final class MonitorModel: NSObject, ObservableObject, UNUserNotificationCenterDe
            let data = try? Data(contentsOf: enginePath), let saved = try? JSONDecoder().decode(SessionStore.self, from: data) {
             store = saved
             store.remove(appID: "demo")
+            let invalidated = store.invalidatePrematureStopCompletions()
+            if !invalidated.isEmpty {
+                for receipt in invalidated {
+                    completions.remove(appID: receipt.appID, sessionID: receipt.sessionID, turnID: receipt.turnID)
+                }
+            }
             store.removeInferred()
             store.expire(now: Date())
             sessions = store.sessions.filter { !($0.evidence == .inferred && $0.stale) }
@@ -74,6 +86,32 @@ final class MonitorModel: NSObject, ObservableObject, UNUserNotificationCenterDe
                 do { try await Task.sleep(for: .seconds(3)) } catch { return }
             }
         }
+        metadataTask = Task { [weak self] in
+            while !Task.isCancelled {
+                guard let self else { return }
+                if !self.paused {
+                    let health = await self.metadataSources.collect()
+                    if !self.paused {
+                        self.diagnostics.merge(health) { _, new in new }
+                    }
+                }
+                do { try await Task.sleep(for: .seconds(3)) } catch { return }
+            }
+        }
+        geminiTask = Task { [weak self] in
+            while !Task.isCancelled {
+                guard let self else { return }
+                if !self.paused && self.windowObservation {
+                    let scan = await self.geminiCollector.collect()
+                    if !self.paused && self.windowObservation {
+                        self.diagnostics.merge(scan.diagnostics) { _, new in new }
+                        self.ingest(scan.events)
+                        _ = self.persistSnapshot()
+                    }
+                }
+                do { try await Task.sleep(for: .seconds(1)) } catch { return }
+            }
+        }
     }
 
     var attentionCount: Int { sessions.filter { $0.state.needsAttention && !$0.stale }.count }
@@ -81,14 +119,43 @@ final class MonitorModel: NSObject, ObservableObject, UNUserNotificationCenterDe
     var completionCount: Int { completions.count }
     var barText: String { statusBarText(sessions: sessions, unreadCompletions: completions.count, paused: paused) }
 
+    func recordsHealth(for appID: String) -> String? {
+        if appID == "claude" {
+            let parts = [("Code", "claude_code_records"), ("Cowork", "claude_records")].compactMap { name, key in
+                diagnostics[key].map { name + " · " + recordsStatus($0) }
+            }
+            return parts.isEmpty ? nil : parts.joined(separator: "\n")
+        }
+        guard appID == "codex", let code = diagnostics["codex_records"] else { return nil }
+        return recordsStatus(code)
+    }
+
+    private func recordsStatus(_ code: String) -> String {
+        switch code {
+        case "ok", "schema_confirmed", "schema_compatible", "no_status_signal": return "本地任务记录可读"
+        case "no_records": return "等待本地任务记录"
+        case "busy": return "正在检查任务记录"
+        case "python_unavailable": return "读取任务记录需要 Python 3"
+        case "adapter_unavailable": return "本地接入组件缺失"
+        case "timeout", "scan_limited": return "正在分批读取任务记录"
+        case "partial": return "部分任务记录暂不可读"
+        default: return "任务记录暂不可读 · 请查看诊断报告"
+        }
+    }
+
     func markCompletionsRead() {
         completions.markAllRead()
         _ = persistSnapshot()
     }
 
+    func showFloatingPanel() { floatingPanel.show(monitor: self) }
+
     func scan() async {
         let observed = NSWorkspace.shared.runningApplications.compactMap(\.bundleIdentifier)
-        runningApps = Set(liveApps.filter { !$0.bundleIDs.filter(observed.contains).isEmpty }.map(\.id))
+        runningApps = Set(liveApps.filter { app in
+            let identities = app.id == "doubao" ? Array(app.bundleIDs.prefix(1)) : app.bundleIDs
+            return !identities.filter(observed.contains).isEmpty
+        }.map(\.id))
         let batch = await collector.collect(windowsEnabled: false)
         guard !paused else { return }
         diagnostics["events"] = batch.diagnostics["events"]
@@ -105,11 +172,11 @@ final class MonitorModel: NSObject, ObservableObject, UNUserNotificationCenterDe
         let now = Date()
         for event in events {
             if let notice = store.apply(event, now: now) {
-                if notice.state == .responseEnded {
+                if notice.state == .responseEnded && shouldRecordCompletion(notice, source: event.source) {
                     completions.record(appID: notice.appID, sessionID: notice.sessionID, turnID: event.turnID)
                 }
                 if now.timeIntervalSince(event.observedAt) <= 30 {
-                    deliver(notice, turnID: event.turnID)
+                    deliver(notice, turnID: event.turnID, source: event.source)
                 }
             }
         }
@@ -124,6 +191,13 @@ final class MonitorModel: NSObject, ObservableObject, UNUserNotificationCenterDe
         }
         let activeIDs = Set(sessions.map(\.id))
         stateSince = stateSince.filter { activeIDs.contains($0.key) }
+    }
+
+    private func shouldRecordCompletion(_ notice: MonitorNotice, source: String) -> Bool {
+        if notice.appID == "gemini" && notice.evidence == .inferred && source.hasPrefix("ax:gemini:") {
+            return notifyWindowCompletions
+        }
+        return true
     }
 
     func grantAccessibility() {
@@ -175,9 +249,12 @@ final class MonitorModel: NSObject, ObservableObject, UNUserNotificationCenterDe
         _ = persistSnapshot()
     }
 
-    private func deliver(_ notice: MonitorNotice, turnID: String) {
-        if notice.evidence == .inferred && !notifyInferred { return }
-        if notice.state == .responseEnded {
+    private func deliver(_ notice: MonitorNotice, turnID: String, source: String = "") {
+        if notice.state == .responseEnded && !shouldRecordCompletion(notice, source: source) { return }
+        let verifiedWindowEnd = notifyWindowCompletions && notice.appID == "gemini"
+            && notice.state == .responseEnded && source.hasPrefix("ax:gemini:")
+        if notice.evidence == .inferred && !notifyInferred && !verifiedWindowEnd { return }
+        if notice.state == .responseEnded && shouldRecordCompletion(notice, source: source) {
             completions.record(appID: notice.appID, sessionID: notice.sessionID, turnID: turnID)
         }
         let message = appName(notice.appID) + " · " + notice.state.label + (notice.evidence == .inferred ? "（推断）" : "")
@@ -211,7 +288,7 @@ final class MonitorModel: NSObject, ObservableObject, UNUserNotificationCenterDe
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
         encoder.dateEncodingStrategy = .iso8601
-        return try encoder.encode(Export(version: "0.2.1-preview", collectedAt: Date(), demoIncluded: demo,
+        return try encoder.encode(Export(version: "0.3.2-preview", collectedAt: Date(), demoIncluded: demo,
                                          statusBar: barText, unreadCompletions: completionCount,
                                          sessions: sessions, diagnostics: diagnostics))
     }

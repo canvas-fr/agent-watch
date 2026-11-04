@@ -1,0 +1,10 @@
+{
+  "layout": "compactCode",
+  "route": "app://localhost/epitaxy/local_01234567-89ab-cdef-0123-456789abcdef",
+  "statusLabel": "Claude is responding",
+  "stopButtonVisible": true,
+  "needsInputTextCount": 0,
+  "optionToggleCount": 0,
+  "questionActionLabels": [],
+  "latestAssistantCopyVisible": false
+}

@@ -1,0 +1,10 @@
+{
+  "layout": "primaryPane",
+  "route": "app://localhost/epitaxy/local_01234567-89ab-cdef-0123-456789abcdef",
+  "statusLabel": "Claude is responding",
+  "stopButtonVisible": true,
+  "needsInputTextCount": 2,
+  "optionToggleCount": 3,
+  "questionActionLabels": ["Skip", "Submit"],
+  "latestAssistantCopyVisible": false
+}

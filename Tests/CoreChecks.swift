@@ -9,9 +9,11 @@ struct CoreChecks {
         try checksNewAndOldTurns()
         try checksOrderingAndFutureRejection()
         try checksSourceDomainOrderingAndPersistence()
+        try checksLegacyStopCompletionMigration()
         try checksTerminalRollbackAndDeduplication()
         try checksPersistenceRoundTrip()
         try checksExpiryAndChildren()
+        try checksParentMetadataAcrossSources()
         try checksCapacity()
         print("PASS: Agent Watch core state, ordering, notice, expiry, and capacity checks")
     }
@@ -229,6 +231,105 @@ struct CoreChecks {
                     "new turn clears the cancelled terminal marker")
     }
 
+    private static func checksLegacyStopCompletionMigration() throws {
+        var store = SessionStore()
+        let start = Date(timeIntervalSince1970: 4_400)
+        let legacyStops: [(appID: String, sessionID: String, source: String)] = [
+            ("codex", "codex-stop", "codex:Stop"),
+            ("codex", "codex-subagent-stop", "codex:SubagentStop"),
+            ("claude_code", "claude-stop", "claude_code:Stop"),
+            ("claude_code", "claude-subagent-stop", "claude_code:SubagentStop"),
+        ]
+
+        for (index, item) in legacyStops.enumerated() {
+            let turnID = "turn-\(item.sessionID)"
+            let runningTime = start.addingTimeInterval(Double(index * 3))
+            _ = store.apply(event("\(item.sessionID)-start", appID: item.appID,
+                                  sessionID: item.sessionID, turnID: turnID,
+                                  parentSessionID: item.sessionID == "codex-stop" ? "parent-session" : nil,
+                                  state: .running, at: runningTime, sequence: 1,
+                                  source: item.appID == "codex" ? "codex:UserPromptSubmit" : "claude_code:UserPromptSubmit"),
+                                now: runningTime)
+            let stopTime = runningTime.addingTimeInterval(1)
+            _ = store.apply(event("\(item.sessionID)-stop", appID: item.appID,
+                                  sessionID: item.sessionID, turnID: turnID,
+                                  state: .responseEnded, at: stopTime, sequence: 2,
+                                  source: item.source), now: stopTime)
+        }
+
+        let journalTime = start.addingTimeInterval(20)
+        _ = store.apply(event("journal-start", appID: "codex", sessionID: "journal-session",
+                              turnID: "journal-turn", state: .running, at: journalTime,
+                              source: "codex_app_server:turn_started"), now: journalTime)
+        let journalEndTime = journalTime.addingTimeInterval(1)
+        _ = store.apply(event("journal-end", appID: "codex", sessionID: "journal-session",
+                              turnID: "journal-turn", state: .responseEnded, at: journalEndTime,
+                              source: "codex_rollout:task_complete"), now: journalEndTime)
+        let alreadyNormalizedTime = journalTime.addingTimeInterval(2)
+        _ = store.apply(event("normalized-stop", appID: "codex", sessionID: "normalized-session",
+                              turnID: "normalized-turn", state: .unknown, at: alreadyNormalizedTime,
+                              source: "codex:Stop:awaiting_confirmation"), now: alreadyNormalizedTime)
+
+        var completions = CompletionInbox()
+        for item in legacyStops {
+            completions.record(appID: item.appID, sessionID: item.sessionID,
+                               turnID: "turn-\(item.sessionID)")
+        }
+        completions.record(appID: "codex", sessionID: "journal-session", turnID: "journal-turn")
+        completions.record(appID: "codex", sessionID: "codex-stop", turnID: "another-turn")
+
+        var restored = try JSONDecoder().decode(SessionStore.self, from: JSONEncoder().encode(store))
+        let invalidated = restored.invalidatePrematureStopCompletions()
+        try expect(invalidated.count == legacyStops.count,
+                   "only the four exact legacy Stop sources are invalidated")
+        for item in legacyStops {
+            let turnID = "turn-\(item.sessionID)"
+            guard let snapshot = restored.sessions.first(where: { $0.sessionID == item.sessionID }) else {
+                throw NSError(domain: "CoreChecks", code: 1,
+                              userInfo: [NSLocalizedDescriptionKey: "CHECK FAILED: migrated Stop snapshot is missing"])
+            }
+            try expect(snapshot.state == .unknown && snapshot.source == item.source + ":awaiting_confirmation",
+                       "legacy Stop terminal state becomes unknown pending durable confirmation")
+            if item.sessionID == "codex-stop" {
+                try expect(snapshot.parentSessionID == "parent-session",
+                           "migration preserves learned parent metadata")
+            }
+            try expect(invalidated.contains(where: {
+                $0.appID == item.appID && $0.sessionID == item.sessionID && $0.turnID == turnID
+            }), "migration returns the exact app, session, and turn receipt key")
+        }
+        for receipt in invalidated {
+            completions.remove(appID: receipt.appID, sessionID: receipt.sessionID, turnID: receipt.turnID)
+        }
+        try expect(completions.count == 2,
+                   "migration removes only matching legacy receipts, preserving journal and other-turn receipts")
+
+        try expect(restored.sessions.first(where: { $0.sessionID == "journal-session" })?.state == .responseEnded,
+                   "a durable journal completion is preserved")
+        try expect(restored.sessions.first(where: { $0.sessionID == "normalized-session" })?.state == .unknown,
+                   "an already-normalized Stop intent remains unknown")
+        try expect(restored.invalidatePrematureStopCompletions().isEmpty,
+                   "repeating the migration does not change already-normalized records")
+
+        let duplicateStopTime = start.addingTimeInterval(3)
+        try expect(restored.apply(event("codex-stop-stop", appID: "codex", sessionID: "codex-stop",
+                                        turnID: "turn-codex-stop", state: .responseEnded,
+                                        at: duplicateStopTime, sequence: 2, source: "codex:Stop"),
+                                  now: duplicateStopTime) == nil,
+                   "migration preserves event-ID deduplication for the original Stop record")
+        let continuedTime = start.addingTimeInterval(4)
+        _ = restored.apply(event("codex-stop-continued", appID: "codex", sessionID: "codex-stop",
+                                 turnID: "turn-codex-stop", state: .running, at: continuedTime,
+                                 sequence: 3, source: "codex:PreToolUse"), now: continuedTime)
+        try expect(restored.sessions.first(where: { $0.sessionID == "codex-stop" })?.state == .running,
+                   "a blocked Stop can continue within the same turn after migration")
+        let trueEndTime = start.addingTimeInterval(5)
+        try expect(restored.apply(event("codex-stop-durable-end", appID: "codex", sessionID: "codex-stop",
+                                        turnID: "turn-codex-stop", state: .responseEnded, at: trueEndTime,
+                                        source: "codex_rollout:task_complete"), now: trueEndTime)?.state == .responseEnded,
+                   "durable same-turn completion can close the migrated session")
+    }
+
     private static func checksPersistenceRoundTrip() throws {
         var store = SessionStore()
         let start = Date(timeIntervalSince1970: 4_800)
@@ -317,6 +418,21 @@ struct CoreChecks {
         }
         try expect(store.sessions.count == 500, "store keeps no more than 500 sessions")
         try expect(!store.sessions.contains { $0.sessionID == "session-0" }, "least recently touched session is evicted")
+    }
+
+    private static func checksParentMetadataAcrossSources() throws {
+        var store = SessionStore()
+        let start = Date(timeIntervalSince1970: 5_500)
+        _ = store.apply(event("parent-start", sessionID: "parent", state: .running, at: start), now: start)
+        _ = store.apply(event("child-hook", sessionID: "child", parentSessionID: "parent",
+                              state: .running, at: start, source: "codex:PreToolUse"), now: start)
+        let end = start.addingTimeInterval(1)
+        _ = store.apply(event("child-journal", sessionID: "child", state: .responseEnded,
+                              at: end, source: "codex_rollout:task_complete"), now: end)
+        try expect(store.sessions.first { $0.sessionID == "child" }?.parentSessionID == "parent",
+                   "a journal without parent metadata preserves the relationship already learned from hooks")
+        try expect(store.sessions.first { $0.sessionID == "parent" }?.state == .running,
+                   "confirmed child completion cannot complete the parent")
     }
 
     private static func event(
