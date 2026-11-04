@@ -40,7 +40,6 @@
     },
     "appID": {
       "enum": [
-        "doubao",
         "antigravity",
         "gemini",
         "codex",

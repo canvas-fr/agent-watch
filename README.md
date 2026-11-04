@@ -2,7 +2,7 @@
 
 本地运行的 macOS 智能体监控器。当前源码为 **0.3.3 预览候选版**：已有持续采集、会话状态、动态菜单栏、可贴边悬浮面板、系统通知、状态导出和打开原应用入口。候选版通过自动检查后，仍须完成原生客户端验收。
 
-**八款目标应用尚未全部通过真实任务验收。** “已安装适配器”“窗口可访问”和“实际识别任务状态”分别记录，不把候选规则当成已验证兼容。
+**当前版移除豆包，冻结新接入。Gemini 与 Devin 为实验项，尚未全部通过真实任务验收。** “已安装适配器”“窗口可访问”和“实际识别任务状态”分别记录，不把候选规则当成已验证兼容。
 
 ## 当前能力
 
@@ -42,7 +42,7 @@ open "dist/Agent Watch.app"
 
 构建目录可通过 `AGENT_WATCH_BUILD_DIR` 指定。若有合适的签名身份，可设置 `AGENT_WATCH_SIGN_IDENTITY`；默认仅本地临时签名，更新后 macOS 可能要求重新授权，见 [权限说明](docs/PERMISSIONS.zh-CN.md)。构建脚本拒绝覆盖已有应用。
 
-窗口中开启辅助功能后才开始实际窗口观察；授权缺失时，已安装的事件桥仍可接收事件。首次使用“开启系统通知”会请求系统授权。其他推断提醒默认关闭；Gemini 有独立的结束提醒开关，关闭后不新增该类未读结束标记。演示按钮只注入明确标记的本地演示数据，不代表真实应用接入；可清除演示。
+默认只采集事件和本地会话记录，不要求辅助功能授权。实验窗口观察默认关闭，手动启用后才需要对应系统权限；授权缺失时，事件桥仍可接收事件。首次使用“开启系统通知”会请求系统授权。窗口推断及 Gemini 结束提醒均默认关闭；关闭后不新增该类未读结束标记。演示按钮只注入明确标记的本地演示数据，不代表真实应用接入；可清除演示。
 
 ## 安装事件桥
 
@@ -77,7 +77,7 @@ Antigravity 的安装与范围见 [ANTIGRAVITY.md](adapters/ANTIGRAVITY.md)，�
 
 Agent Watch is a local-first macOS agent monitor. The source is a 0.3.3 preview candidate with a dynamic menu bar, an edge panel, a persistent state machine, metadata-only lifecycle readers, conservative window inference, notifications, and local status export.
 
-**It has not passed end-to-end acceptance for all eight desktop products.** Claude Code and API Cowork have live lifecycle evidence on 4.4212.0 using Sonnet Low. Codex now confirms completion from its lifecycle journal; Stop hooks alone are not completion evidence. DSH and WorkBuddy have earlier live activity/turn-end receipts. Antigravity 2.28.2 also passed a real question-and-answer lifecycle, while its native cancellation callback was not observed. Other integrations are explicitly marked as installed, fixture-tested, inferred, blocked, or unverified in the matrix above. CLI support never implies desktop support. Hidden conversations are not guaranteed by window observation.
+**Doubao is out of scope for this preview; new integrations are frozen. Gemini and Devin remain experimental.** Claude Code and API Cowork have live lifecycle evidence on 4.4212.0 using Sonnet Low. Codex now confirms completion from its lifecycle journal; Stop hooks alone are not completion evidence. DSH and WorkBuddy have earlier live activity/turn-end receipts. Antigravity 2.28.2 also passed a real question-and-answer lifecycle, while its native cancellation callback was not observed. Other integrations are explicitly marked as installed, fixture-tested, inferred, blocked, or unverified in the matrix above. CLI support never implies desktop support. Hidden conversations are not guaranteed by window observation.
 
 Build with Swift 6 using `bash scripts/build-monitor.sh`, and check with `bash scripts/check.sh`. No third-party Swift package is required. Python 3 is used for hook bridges; Node.js is used for the DSH plugin checks. Existing access settings are not bypassed. See adapter documentation before enabling a source.
 
@@ -86,3 +86,5 @@ Build with Swift 6 using `bash scripts/build-monitor.sh`, and check with `bash s
 Apache-2.0. System frameworks are used under their respective platform terms. No third-party pet artwork or application branding is distributed. Referenced projects are research leads, not affiliations or proof of compatibility.
 
 开发优先级：先完成功能与逐应用验收；后续视觉参考 CC Switch。平时使用状态栏，点击再展开详情。
+
+范围收敛：豆包不再进入当前主程序的应用列表或窗口采集。保留的旧探测器/历史失败记录只用于研究回溯，不代表当前接入；不再提供豆包实验启动入口。

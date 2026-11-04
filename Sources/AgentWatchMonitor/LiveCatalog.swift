@@ -11,13 +11,12 @@ struct LiveApp: Identifiable, Sendable {
 }
 
 let liveApps: [LiveApp] = [
-    .init(id: "doubao", name: "豆包", bundleIDs: ["com.bot.neotix.doubao", "com.bot.neotix.doubao.browser"], capability: "主窗口与内嵌浏览器 · 状态观察"),
     .init(id: "antigravity", name: "Antigravity", bundleIDs: ["com.google.antigravity"], capability: "官方事件 / 窗口观察"),
-    .init(id: "gemini", name: "Gemini", bundleIDs: ["com.google.GeminiMacOS"], capability: "普通聊天窗口 · 连续状态与结束推断"),
+    .init(id: "gemini", name: "Gemini", bundleIDs: ["com.google.GeminiMacOS"], capability: "实验 · 窗口结束推断，默认关闭"),
     .init(id: "codex", name: "ChatGPT / Codex", bundleIDs: ["com.openai.codex", "com.openai.chat"], capability: "Codex 事件接入 / 窗口观察"),
     .init(id: "claude", name: "Claude", bundleIDs: ["com.anthropic.claudefordesktop"], capability: "Code 事件 / 本地 Chat、Cowork 记录"),
     .init(id: "dsh", name: "DeepSeek Harness", bundleIDs: ["com.deepseek.dsh"], capability: "会话事件 / 窗口观察"),
-    .init(id: "devin", name: "Devin", bundleIDs: ["com.exafunction.windsurf"], capability: "Local 运行与授权 / 最终结束待确认"),
+    .init(id: "devin", name: "Devin", bundleIDs: ["com.exafunction.windsurf"], capability: "实验 · Local 运行与授权，结束未知"),
     .init(id: "workbuddy", name: "WorkBuddy", bundleIDs: ["com.tencent.workbuddy.mac"], capability: "会话事件 / 窗口观察")
 ]
 

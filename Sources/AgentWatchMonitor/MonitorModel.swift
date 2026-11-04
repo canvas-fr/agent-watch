@@ -11,9 +11,9 @@ final class MonitorModel: NSObject, ObservableObject, UNUserNotificationCenterDe
     @Published var runningApps = Set<String>()
     @Published var lastScan: Date?
     @Published var paused = false
-    @Published var windowObservation = true
+    @Published var windowObservation = false
     @Published var notifyInferred = false
-    @Published var notifyWindowCompletions = true
+    @Published var notifyWindowCompletions = false
     @Published var notificationsEnabled = false
     @Published var statusMessage = "等待首次采集"
     @Published var recentNotices: [String] = []
@@ -50,6 +50,7 @@ final class MonitorModel: NSObject, ObservableObject, UNUserNotificationCenterDe
            let data = try? Data(contentsOf: enginePath), let saved = try? JSONDecoder().decode(SessionStore.self, from: data) {
             store = saved
             store.remove(appID: "demo")
+            store.remove(appID: "doubao")
             let invalidated = store.invalidateUnconfirmedCompletions()
             if !invalidated.isEmpty {
                 for receipt in invalidated {
@@ -178,7 +179,8 @@ final class MonitorModel: NSObject, ObservableObject, UNUserNotificationCenterDe
         }
         ingest(batch.events)
         lastScan = Date()
-        statusMessage = AXIsProcessTrusted() ? "持续采集中 · 窗口规则为推断，隐藏会话需事件接入" : "事件接收已运行 · 窗口观察需要辅助功能权限"
+        statusMessage = !windowObservation ? "事件与本地记录采集中 · 实验窗口观察未启用"
+            : AXIsProcessTrusted() ? "持续采集中 · 窗口规则为推断，隐藏会话需事件接入" : "事件接收已运行 · 窗口观察需要辅助功能权限"
         if persistSnapshot() { await collector.acknowledge(batch.consumedFiles) }
     }
 
