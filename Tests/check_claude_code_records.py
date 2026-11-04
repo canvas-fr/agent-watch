@@ -101,41 +101,97 @@ class ClaudeCodeRecordChecks(unittest.TestCase):
             metadata["completedTurns"] = completed
         record_path.write_text(json.dumps(metadata), encoding="utf-8")
 
-    def write_journal(self, records: list[dict[str, object]]) -> None:
+    def write_journal(self, records: list[dict[str, object]], cli_id: str | None = None) -> None:
         directory = self.home / ".claude" / "projects" / "project-hash"
         directory.mkdir(parents=True, exist_ok=True)
-        journal = directory / f"{self.cli_session_id}.jsonl"
+        journal = directory / f"{cli_id or self.cli_session_id}.jsonl"
         with journal.open("w", encoding="utf-8") as output:
             for record in records:
                 output.write(json.dumps(record, separators=(",", ":")) + "\n")
 
-    def root_user(self, prompt_id: str, frame: datetime, uuid: str) -> dict[str, object]:
-        return {
+    def root_user(
+        self, prompt_id: str, frame: datetime, uuid: str, cli_id: str | None = None,
+        text: str = "PRIVATE_JOURNAL_BODY_DO_NOT_CAPTURE",
+        version: str | None = "2.1.309",
+    ) -> dict[str, object]:
+        record: dict[str, object] = {
             "type": "user", "uuid": uuid, "promptId": prompt_id,
             "timestamp": frame.isoformat().replace("+00:00", "Z"),
-            "sessionId": self.cli_session_id,
-            "message": {"content": "PRIVATE_JOURNAL_BODY_DO_NOT_CAPTURE"},
+            "sessionId": cli_id or self.cli_session_id, "isSidechain": False,
+            "origin": {"kind": "cli"},
+            "message": {"role": "user", "content": text},
         }
+        if version is not None:
+            record["version"] = version
+        return record
 
-    def root_attachment(self, attachment_uuid: str, parent_uuid: str) -> dict[str, object]:
+    def root_attachment(
+        self, attachment_uuid: str, parent_uuid: str, cli_id: str | None = None,
+    ) -> dict[str, object]:
         return {
             "type": "attachment", "uuid": attachment_uuid, "parentUuid": parent_uuid,
-            "sessionId": self.cli_session_id,
+            "sessionId": cli_id or self.cli_session_id,
             "attachment": {"text": "PRIVATE_ATTACHMENT_BODY_DO_NOT_CAPTURE"},
         }
 
     def root_assistant(
-        self, assistant_uuid: str, parent_uuid: str, at: datetime, stop_reason: str = "end_turn"
+        self, assistant_uuid: str, parent_uuid: str, at: datetime,
+        stop_reason: str | None = "end_turn", cli_id: str | None = None,
+        version: str | None = "2.1.309",
     ) -> dict[str, object]:
-        return {
+        record: dict[str, object] = {
             "type": "assistant", "uuid": assistant_uuid, "parentUuid": parent_uuid,
             "timestamp": at.isoformat().replace("+00:00", "Z"),
-            "sessionId": self.cli_session_id,
+            "sessionId": cli_id or self.cli_session_id, "isSidechain": False,
             "message": {
+                "id": "msg_" + assistant_uuid,
+                "role": "assistant",
                 "stop_reason": stop_reason,
                 "content": "PRIVATE_ASSISTANT_BODY_DO_NOT_CAPTURE",
             },
         }
+        if version is not None:
+            record["version"] = version
+        return record
+
+    def root_aborted_assistant(
+        self, assistant_uuid: str, parent_uuid: str, at: datetime,
+        cli_id: str | None = None, *, sidechain: bool = False,
+        version: str | None = "2.1.309",
+    ) -> dict[str, object]:
+        record: dict[str, object] = {
+            "type": "assistant", "uuid": assistant_uuid, "parentUuid": parent_uuid,
+            "timestamp": at.isoformat().replace("+00:00", "Z"),
+            "sessionId": cli_id or self.cli_session_id, "isSidechain": sidechain,
+            "isAbortedMidStream": True,
+            "message": {
+                "id": "msg_" + assistant_uuid,
+                "role": "assistant",
+                "stop_reason": None,
+                "content": [{"type": "text", "text": "PRIVATE_ABORTED_TEXT_DO_NOT_CAPTURE"}],
+            },
+        }
+        if version is not None:
+            record["version"] = version
+        return record
+
+    def root_interrupt_marker(
+        self, prompt_id: str, marker_uuid: str, parent_uuid: str, at: datetime,
+        marker: str = "[Request interrupted by user]",
+        cli_id: str | None = None, *, sidechain: bool = False, origin: bool = False,
+        version: str | None = "2.1.309",
+    ) -> dict[str, object]:
+        record: dict[str, object] = {
+            "type": "user", "uuid": marker_uuid, "parentUuid": parent_uuid,
+            "promptId": prompt_id, "timestamp": at.isoformat().replace("+00:00", "Z"),
+            "sessionId": cli_id or self.cli_session_id, "isSidechain": sidechain,
+            "message": {"role": "user", "content": [{"type": "text", "text": marker}]},
+        }
+        if origin:
+            record["origin"] = {"kind": "cli"}
+        if version is not None:
+            record["version"] = version
+        return record
 
     def read_events(self) -> list[dict[str, object]]:
         return [json.loads(path.read_text(encoding="utf-8")) for path in sorted(self.events.glob("*.json"))]
@@ -267,6 +323,410 @@ class ClaudeCodeRecordChecks(unittest.TestCase):
         self.assertEqual(latest["state"], "unknown")
         self.assertNotIn(latest["state"], {"cancelled", "responseEnded"})
 
+    def test_active_journal_probe_does_not_emit_a_mtime_heartbeat(self) -> None:
+        frame = self.now - timedelta(seconds=5)
+        self.write_metadata(completed=0, frame=frame, edge=frame - timedelta(seconds=1))
+        self.write_journal([self.root_user("prompt-heartbeat", frame, "human-heartbeat")])
+        self.assertEqual(self.reader.poll_once().events_written, 1)
+        self.assertEqual(self.reader.poll_once().events_written, 0)
+        self.assertEqual([record["state"] for record in self.read_events()], ["running"])
+
+    def test_current_prompt_interrupt_cancels_tracked_run_without_counter_or_assistant_change(self) -> None:
+        frame = self.now - timedelta(seconds=5)
+        self.write_metadata(completed=0, frame=frame, edge=frame - timedelta(seconds=1))
+        self.write_journal([self.root_user("prompt-A", frame, "human-A")])
+        self.assertEqual(self.reader.poll_once().events_written, 1)
+        self.assertEqual(self.ordered_events()[-1]["state"], "running")
+
+        self.now += timedelta(seconds=1)
+        parent_at = self.now - timedelta(milliseconds=200)
+        marker_at = self.now - timedelta(milliseconds=100)
+        self.write_metadata(
+            completed=0, frame=frame,
+            edge=frame - timedelta(milliseconds=185), cut_short=True,
+        )
+        self.write_journal([
+            self.root_user("prompt-A", frame, "human-A"),
+            self.root_aborted_assistant("assistant-aborted-A", "human-A", parent_at),
+            self.root_interrupt_marker("prompt-A", "interrupt-A", "assistant-aborted-A", marker_at),
+        ])
+
+        result = self.reader.poll_once()
+        self.assertEqual(result.events_written, 1)
+        terminal = self.ordered_events()[-1]
+        self.assertEqual(terminal["state"], "cancelled")
+        self.assertEqual(terminal["evidence"], "explicit")
+        self.assertEqual(terminal["turnID"], "prompt-A")
+        self.assertEqual(terminal["source"], "claude_code_records:journal_user_interrupt")
+
+        serialized = self.state.read_text(encoding="utf-8") + "\n".join(
+            path.read_text(encoding="utf-8") for path in self.events.glob("*.json")
+        )
+        self.assertNotIn("[Request interrupted by user]", serialized)
+        self.assertNotIn("PRIVATE_ABORTED_TEXT_DO_NOT_CAPTURE", serialized)
+
+        restarted = self.make_reader()
+        self.assertEqual(restarted.poll_once().events_written, 0)
+        self.assertEqual(sum(record["state"] == "cancelled" for record in self.read_events()), 1)
+
+    def test_old_frame_of_still_tracked_run_keeps_bounded_interrupt_polling(self) -> None:
+        frame = self.now - timedelta(seconds=5)
+        self.write_metadata(completed=0, frame=frame, edge=frame - timedelta(seconds=1))
+        self.write_journal([self.root_user("prompt-long", frame, "human-long")])
+        self.reader.poll_once()
+        self.assertEqual(self.ordered_events()[-1]["state"], "running")
+
+        self.now += timedelta(seconds=40)
+        marker_at = self.now - timedelta(milliseconds=100)
+        self.write_metadata(
+            completed=0, frame=frame,
+            edge=frame - timedelta(milliseconds=185), cut_short=True,
+        )
+        self.write_journal([
+            self.root_user("prompt-long", frame, "human-long"),
+            self.root_aborted_assistant(
+                "assistant-long", "human-long", marker_at - timedelta(milliseconds=100)
+            ),
+            self.root_interrupt_marker("prompt-long", "interrupt-long", "assistant-long", marker_at),
+        ])
+
+        result = self.reader.poll_once()
+        self.assertEqual(result.events_written, 1)
+        terminal = self.ordered_events()[-1]
+        self.assertEqual(terminal["state"], "cancelled")
+        self.assertEqual(terminal["turnID"], "prompt-long")
+
+    def test_later_human_prompt_invalidates_prior_turn_marker(self) -> None:
+        frame = self.now - timedelta(seconds=5)
+        self.write_metadata(completed=0, frame=frame, edge=frame - timedelta(seconds=1))
+        self.write_journal([self.root_user("prompt-old", frame, "human-old")])
+        self.reader.poll_once()
+
+        self.now += timedelta(seconds=1)
+        later_prompt_at = self.now - timedelta(milliseconds=300)
+        parent_at = self.now - timedelta(milliseconds=200)
+        marker_at = self.now - timedelta(milliseconds=100)
+        self.write_metadata(completed=0, frame=frame, edge=frame - timedelta(milliseconds=185), cut_short=True)
+        self.write_journal([
+            self.root_user("prompt-old", frame, "human-old"),
+            self.root_aborted_assistant("assistant-old", "human-old", parent_at),
+            self.root_user("prompt-later", later_prompt_at, "human-later"),
+            self.root_interrupt_marker("prompt-old", "interrupt-old", "assistant-old", marker_at),
+        ])
+
+        self.assertEqual(self.reader.poll_once().events_written, 0)
+        self.assertFalse(any(record["state"] == "cancelled" for record in self.read_events()))
+
+    def test_truncated_later_prompt_blocks_old_turn_fallback(self) -> None:
+        frame = self.now - timedelta(seconds=5)
+        self.write_metadata(completed=0, frame=frame, edge=frame - timedelta(seconds=1))
+        self.write_journal([self.root_user("prompt-old", frame, "human-old")])
+        self.reader.poll_once()
+
+        self.now += timedelta(seconds=1)
+        later_prompt_at = self.now - timedelta(milliseconds=300)
+        parent_at = self.now - timedelta(milliseconds=200)
+        marker_at = self.now - timedelta(milliseconds=100)
+        later_user = self.root_user("prompt-later", later_prompt_at, "human-later")
+        later_user["message"] = {
+            "role": "user",
+            "content": [
+                {"type": "text", "text": f"PRIVATE_LONG_PROMPT_BLOCK_{index}"}
+                for index in range(40)
+            ],
+        }
+        self.write_metadata(completed=0, frame=frame, edge=frame - timedelta(milliseconds=185), cut_short=True)
+        self.write_journal([
+            self.root_user("prompt-old", frame, "human-old"),
+            self.root_aborted_assistant("assistant-old", "human-old", parent_at),
+            later_user,
+            self.root_interrupt_marker("prompt-old", "interrupt-old", "assistant-old", marker_at),
+        ])
+
+        self.assertEqual(self.reader.poll_once().events_written, 0)
+        self.assertFalse(any(record["state"] == "cancelled" for record in self.read_events()))
+
+    def test_bootstrap_interrupt_marker_is_history_not_new_cancel(self) -> None:
+        frame = self.now - timedelta(seconds=2)
+        parent_at = self.now - timedelta(milliseconds=200)
+        marker_at = self.now - timedelta(milliseconds=100)
+        self.write_metadata(
+            completed=0, frame=frame,
+            edge=frame - timedelta(milliseconds=185), cut_short=True,
+        )
+        self.write_journal([
+            self.root_user("prompt-bootstrap", frame, "human-bootstrap"),
+            self.root_aborted_assistant("assistant-bootstrap", "human-bootstrap", parent_at),
+            self.root_interrupt_marker(
+                "prompt-bootstrap", "interrupt-bootstrap", "assistant-bootstrap", marker_at
+            ),
+        ])
+
+        self.assertEqual(self.reader.poll_once().events_written, 0)
+        self.assertEqual(self.read_events(), [])
+        self.assertEqual(self.reader.poll_once().events_written, 0)
+        self.assertEqual(self.read_events(), [])
+
+    def test_active_prompt_id_can_anchor_marker_when_human_frame_is_outside_tail(self) -> None:
+        frame = self.now - timedelta(seconds=5)
+        self.write_metadata(completed=0, frame=frame, edge=frame - timedelta(seconds=1))
+        self.write_journal([self.root_user("prompt-tail", frame, "human-tail")])
+        self.assertEqual(self.reader.poll_once().events_written, 1)
+        self.assertEqual(self.ordered_events()[-1]["turnID"], "prompt-tail")
+
+        self.now += timedelta(seconds=1)
+        parent_at = self.now - timedelta(milliseconds=200)
+        marker_at = self.now - timedelta(milliseconds=100)
+        self.write_metadata(completed=0, frame=frame,
+                            edge=frame - timedelta(milliseconds=185), cut_short=True)
+        padding = {
+            "type": "attachment", "uuid": "padding-record", "sessionId": self.cli_session_id,
+            "payload": "SYNTHETIC_PADDING_DO_NOT_CAPTURE" * 12_000,
+        }
+        self.write_journal([
+            self.root_user("prompt-tail", frame, "human-tail"),
+            padding,
+            self.root_aborted_assistant("assistant-tail", "human-tail", parent_at),
+            self.root_interrupt_marker("prompt-tail", "interrupt-tail", "assistant-tail", marker_at),
+        ])
+        result = self.reader.poll_once()
+        self.assertEqual(result.events_written, 1)
+        self.assertEqual(self.ordered_events()[-1]["state"], "cancelled")
+        self.assertEqual(self.ordered_events()[-1]["turnID"], "prompt-tail")
+
+    def test_tool_use_rejection_marker_does_not_cancel_whole_turn(self) -> None:
+        frame = self.now - timedelta(seconds=5)
+        self.write_metadata(completed=0, frame=frame, edge=frame - timedelta(seconds=1))
+        self.write_journal([self.root_user("prompt-tool", frame, "human-tool")])
+        self.reader.poll_once()
+
+        self.now += timedelta(seconds=1)
+        self.write_metadata(completed=0, frame=frame, edge=frame - timedelta(milliseconds=185), cut_short=True)
+        self.write_journal([
+            self.root_user("prompt-tool", frame, "human-tool"),
+            self.root_assistant("assistant-tool", "human-tool", self.now - timedelta(milliseconds=300),
+                                stop_reason="tool_use"),
+            {
+                "type": "user", "uuid": "tool-result", "parentUuid": "assistant-tool",
+                "promptId": "prompt-tool", "sessionId": self.cli_session_id,
+                "isSidechain": False, "toolUseResult": "PRIVATE_TOOL_RESULT_DO_NOT_CAPTURE",
+                "message": {"role": "user", "content": [{
+                    "type": "tool_result", "tool_use_id": "tool-use-id", "is_error": True,
+                    "content": "PRIVATE_TOOL_ERROR_DO_NOT_CAPTURE",
+                }]},
+            },
+            self.root_interrupt_marker(
+                "prompt-tool", "interrupt-tool", "tool-result", self.now - timedelta(milliseconds=100),
+                marker="[Request interrupted by user for tool use]",
+            ),
+        ])
+        self.assertEqual(self.reader.poll_once().events_written, 0)
+        self.assertFalse(any(record["state"] == "cancelled" for record in self.read_events()))
+
+    def test_forged_human_marker_and_api_blob_substring_do_not_cancel(self) -> None:
+        frame = self.now - timedelta(seconds=5)
+        self.write_metadata(completed=0, frame=frame, edge=frame - timedelta(seconds=1))
+        self.write_journal([self.root_user(
+            "prompt-quoted", frame, "human-quoted", text="[Request interrupted by user]"
+        )])
+        self.reader.poll_once()
+
+        self.now += timedelta(seconds=1)
+        self.write_metadata(completed=0, frame=frame, edge=frame - timedelta(milliseconds=185), cut_short=True)
+        self.write_journal([
+            self.root_user("prompt-quoted", frame, "human-quoted"),
+            self.root_aborted_assistant("assistant-quoted", "human-quoted", self.now - timedelta(milliseconds=200)),
+            self.root_interrupt_marker(
+                "prompt-quoted", "forged-marker", "assistant-quoted", self.now - timedelta(milliseconds=100),
+                origin=True,
+            ),
+            self.root_interrupt_marker(
+                "prompt-quoted", "quoted-marker", "assistant-quoted", self.now - timedelta(milliseconds=50),
+                marker="quoted [Request interrupted by user] text",
+            ),
+            {
+                "type": "api-request-blob", "sessionId": self.cli_session_id,
+                "message": {"role": "user", "content": [{
+                    "type": "text", "text": "PRIVATE_API_CACHE [Request interrupted by user] suffix"
+                }]},
+            },
+        ])
+        self.assertEqual(self.reader.poll_once().events_written, 0)
+        self.assertFalse(any(record["state"] == "cancelled" for record in self.read_events()))
+
+    def test_json_escape_of_marker_ascii_bytes_is_not_decoded_as_a_match(self) -> None:
+        frame = self.now - timedelta(seconds=5)
+        self.write_metadata(completed=0, frame=frame, edge=frame - timedelta(seconds=1))
+        self.write_journal([self.root_user("prompt-escape", frame, "human-escape")])
+        self.reader.poll_once()
+
+        self.now += timedelta(seconds=1)
+        parent_at = self.now - timedelta(milliseconds=200)
+        marker_at = self.now - timedelta(milliseconds=100)
+        self.write_metadata(completed=0, frame=frame, edge=frame - timedelta(milliseconds=185), cut_short=True)
+        self.write_journal([
+            self.root_user("prompt-escape", frame, "human-escape"),
+            self.root_aborted_assistant("assistant-escape", "human-escape", parent_at),
+            self.root_interrupt_marker("prompt-escape", "interrupt-escape", "assistant-escape", marker_at),
+        ])
+        journal = self.home / ".claude" / "projects" / "project-hash" / f"{self.cli_session_id}.jsonl"
+        raw = journal.read_bytes()
+        exact_json_token = b'"text":"[Request interrupted by user]"'
+        escaped_json_token = b'"text":"\\u005bRequest interrupted by user]"'
+        self.assertIn(exact_json_token, raw)
+        journal.write_bytes(raw.replace(exact_json_token, escaped_json_token, 1))
+
+        self.assertEqual(self.reader.poll_once().events_written, 0)
+        self.assertFalse(any(record["state"] == "cancelled" for record in self.read_events()))
+
+    def test_wrong_prompt_parent_and_sidechain_markers_do_not_cancel(self) -> None:
+        frame = self.now - timedelta(seconds=5)
+        self.write_metadata(completed=0, frame=frame, edge=frame - timedelta(seconds=1))
+        self.write_journal([self.root_user("prompt-current", frame, "human-current")])
+        self.reader.poll_once()
+
+        for case in (
+            "wrong-prompt", "wrong-parent", "sidechain", "not-aborted", "missing-stop",
+            "unknown-human-version", "unknown-parent-version", "unknown-marker-version",
+            "missing-marker-version",
+        ):
+            self.now += timedelta(milliseconds=100)
+            self.write_metadata(completed=0, frame=frame, edge=frame - timedelta(milliseconds=185), cut_short=True)
+            assistant_id = "assistant-" + case
+            parent_at = self.now - timedelta(milliseconds=200)
+            if case == "not-aborted":
+                assistant = self.root_assistant(assistant_id, "human-current", parent_at, stop_reason=None)
+            else:
+                assistant = self.root_aborted_assistant(
+                    assistant_id, "human-current", parent_at,
+                    sidechain=case == "sidechain",
+                    version="2.1.296" if case == "unknown-parent-version" else "2.1.309",
+                )
+                if case == "missing-stop":
+                    del assistant["message"]["stop_reason"]  # type: ignore[index]
+            marker = self.root_interrupt_marker(
+                "prompt-other" if case == "wrong-prompt" else "prompt-current",
+                "marker-" + case,
+                "unrelated-parent" if case == "wrong-parent" else assistant_id,
+                self.now - timedelta(milliseconds=100),
+                sidechain=case == "sidechain",
+                version=(
+                    None if case == "missing-marker-version"
+                    else "2.1.296" if case == "unknown-marker-version"
+                    else "2.1.309"
+                ),
+            )
+            self.write_journal([
+                self.root_user(
+                    "prompt-current", frame, "human-current",
+                    version="2.1.296" if case == "unknown-human-version" else "2.1.309",
+                ),
+                assistant,
+                marker,
+            ])
+            self.assertEqual(self.reader.poll_once().events_written, 0, case)
+
+        self.assertFalse(any(record["state"] == "cancelled" for record in self.read_events()))
+
+    def test_unknown_human_version_does_not_fallback_after_prompt_leaves_tail(self) -> None:
+        frame = self.now - timedelta(seconds=5)
+        self.write_metadata(completed=0, frame=frame, edge=frame - timedelta(seconds=1))
+        self.write_journal([
+            self.root_user("prompt-unverified", frame, "human-unverified", version="2.1.296")
+        ])
+        self.reader.poll_once()
+        self.assertTrue(self.reader.cursors[next(iter(self.reader.cursors))].active_run_seen)
+        self.assertFalse(
+            self.reader.cursors[next(iter(self.reader.cursors))].active_interrupt_version_supported
+        )
+
+        self.now += timedelta(seconds=1)
+        parent_at = self.now - timedelta(milliseconds=200)
+        marker_at = self.now - timedelta(milliseconds=100)
+        self.write_metadata(completed=0, frame=frame, edge=frame - timedelta(milliseconds=185), cut_short=True)
+        self.write_journal([
+            self.root_aborted_assistant("assistant-unverified", "human-unverified", parent_at),
+            self.root_interrupt_marker(
+                "prompt-unverified", "interrupt-unverified", "assistant-unverified", marker_at
+            ),
+        ])
+
+        self.assertEqual(self.reader.poll_once().events_written, 0)
+        self.assertFalse(any(record["state"] == "cancelled" for record in self.read_events()))
+
+    def test_normal_end_turn_wins_over_interrupt_marker_race(self) -> None:
+        frame = self.now - timedelta(seconds=5)
+        self.write_metadata(completed=0, frame=frame, edge=frame - timedelta(seconds=1))
+        self.write_journal([self.root_user("prompt-race", frame, "human-race")])
+        self.reader.poll_once()
+
+        self.now += timedelta(seconds=1)
+        assistant_end_at = self.now - timedelta(milliseconds=50)
+        self.write_metadata(
+            completed=1, frame=frame, edge=assistant_end_at, assistant_uuid="assistant-end-race",
+        )
+        self.write_journal([
+            self.root_user("prompt-race", frame, "human-race"),
+            self.root_aborted_assistant("assistant-aborted-race", "human-race",
+                                        self.now - timedelta(milliseconds=300)),
+            self.root_interrupt_marker("prompt-race", "interrupt-race", "assistant-aborted-race",
+                                       self.now - timedelta(milliseconds=200)),
+            self.root_assistant("assistant-end-race", "assistant-aborted-race", assistant_end_at),
+        ])
+        self.reader.poll_once()
+        states = [record["state"] for record in self.read_events()]
+        self.assertIn("responseEnded", states)
+        self.assertNotIn("cancelled", states)
+
+    def test_active_journal_probe_budget_rotates_across_sessions(self) -> None:
+        second_local_id = "local_00000000-0000-4000-8000-000000000002"
+        second_cli_id = "cli-session-2"
+        second_path = self.add_session(second_local_id, second_cli_id)
+        frame_one = self.now - timedelta(seconds=5)
+        frame_two = self.now - timedelta(seconds=4)
+        self.write_metadata(completed=0, frame=frame_one, edge=frame_one - timedelta(seconds=1))
+        self.write_metadata(
+            completed=0, frame=frame_two, edge=frame_two - timedelta(seconds=1),
+            path=second_path, local_id=second_local_id, cli_id=second_cli_id,
+        )
+        self.write_journal([self.root_user("prompt-one", frame_one, "human-one")])
+        self.write_journal(
+            [self.root_user("prompt-two", frame_two, "human-two", cli_id=second_cli_id)],
+            cli_id=second_cli_id,
+        )
+
+        with patch.object(ADAPTER, "MAX_JOURNAL_LOOKUPS_PER_POLL", 1):
+            self.reader.poll_once()
+            self.assertEqual(len(self.reader.cursors), 1)
+            self.reader.poll_once()
+            self.assertEqual(len(self.reader.cursors), 2)
+
+            self.now += timedelta(seconds=1)
+            parent_at = self.now - timedelta(milliseconds=200)
+            marker_at = self.now - timedelta(milliseconds=100)
+            self.write_metadata(
+                completed=0, frame=frame_two,
+                edge=frame_two - timedelta(milliseconds=185), cut_short=True,
+                path=second_path, local_id=second_local_id, cli_id=second_cli_id,
+            )
+            self.write_journal([
+                self.root_user("prompt-two", frame_two, "human-two", cli_id=second_cli_id),
+                self.root_aborted_assistant("assistant-two", "human-two", parent_at, cli_id=second_cli_id),
+                self.root_interrupt_marker("prompt-two", "interrupt-two", "assistant-two", marker_at,
+                                           cli_id=second_cli_id),
+            ], cli_id=second_cli_id)
+
+            # One poll spends its journal lookup on the first session; rotation
+            # must carry the deferred second session into a later poll.
+            self.reader.poll_once()
+            self.assertFalse(any(record["state"] == "cancelled" for record in self.read_events()))
+            self.reader.poll_once()
+
+        cancellations = [record for record in self.read_events() if record["state"] == "cancelled"]
+        self.assertEqual(len(cancellations), 1)
+        self.assertEqual(cancellations[0]["sessionID"], second_cli_id)
+        self.assertEqual(cancellations[0]["turnID"], "prompt-two")
+
     def test_fresh_error_takes_priority_over_success_counter(self) -> None:
         frame = self.now - timedelta(seconds=5)
         self.write_metadata(completed=0, frame=frame, edge=frame - timedelta(seconds=1))
@@ -304,6 +764,36 @@ class ClaudeCodeRecordChecks(unittest.TestCase):
         ])
         self.reader.poll_once()
         self.assertFalse(any(record["state"] == "responseEnded" for record in self.read_events()))
+
+    def test_end_turn_mapping_survives_bounded_large_content_projection(self) -> None:
+        frame = self.now - timedelta(seconds=5)
+        assistant_at = self.now - timedelta(seconds=1)
+        self.write_metadata(completed=0, frame=frame, edge=frame - timedelta(seconds=1))
+        self.write_journal([self.root_user("prompt-many-blocks", frame, "human-many-blocks")])
+        self.reader.poll_once()
+
+        self.now += timedelta(seconds=2)
+        self.write_metadata(
+            completed=1, frame=frame, edge=assistant_at, assistant_uuid="assistant-many-blocks",
+        )
+        self.write_journal([
+            self.root_user("prompt-many-blocks", frame, "human-many-blocks"),
+            self.root_attachment("attachment-many-blocks", "human-many-blocks"),
+            {
+                "type": "assistant", "uuid": "assistant-many-blocks",
+                "parentUuid": "attachment-many-blocks", "timestamp": assistant_at.isoformat().replace("+00:00", "Z"),
+                "sessionId": self.cli_session_id, "isSidechain": False,
+                "message": {
+                    "id": "msg_assistant-many-blocks", "role": "assistant", "stop_reason": "end_turn",
+                    "content": [
+                        {"type": "text", "text": f"PRIVATE_BLOCK_{index}_DO_NOT_CAPTURE"}
+                        for index in range(40)
+                    ],
+                },
+            },
+        ])
+        self.reader.poll_once()
+        self.assertEqual(self.ordered_events()[-1]["state"], "responseEnded")
 
     def test_assistant_uuid_change_without_counter_does_not_end(self) -> None:
         frame = self.now - timedelta(seconds=5)

@@ -34,10 +34,17 @@ MAX_SESSIONS = 500
 MAX_SESSIONS_PER_POLL = 64
 MAX_DIRECTORY_ENTRIES = 2_000
 MAX_PROJECT_ENTRIES = 5_000
+MAX_JOURNAL_LOOKUPS_PER_POLL = 8
+MAX_JOURNAL_RECORDS_PER_LOOKUP = 5_000
+MAX_MESSAGE_BLOCKS = 32
 MAX_JSON_DEPTH = 64
 FRESH_FRAME_SECONDS = 30.0
 FUTURE_TOLERANCE_SECONDS = 30.0
 TIMESTAMP_MATCH_TOLERANCE_SECONDS = 0.001
+SUPPORTED_CANCELLATION_CLI_VERSION = "2.1.309"
+STANDARD_INTERRUPT_MARKER = b"[Request interrupted by user]"
+TOOL_INTERRUPT_MARKER = b"[Request interrupted by user for tool use]"
+_ORIGIN_OBJECT = object()
 
 METADATA_FIELDS = frozenset({
     "sessionId", "cliSessionId", "completedTurns", "latestUserFrameAt",
@@ -46,6 +53,7 @@ METADATA_FIELDS = frozenset({
 })
 JOURNAL_FIELDS = frozenset({
     "type", "timestamp", "promptId", "sessionId", "parentUuid", "isSidechain", "uuid", "message",
+    "origin", "isMeta", "isAbortedMidStream", "toolUseResult", "version",
 })
 ROOT_FIELD_TOKENS = {
     (f'"{field}"').encode("ascii"): field
@@ -53,11 +61,11 @@ ROOT_FIELD_TOKENS = {
 }
 STRING_FIELDS = frozenset({
     "sessionId", "cliSessionId", "errorCategory", "type", "promptId",
-    "parentUuid", "lastAssistantUuid", "uuid",
+    "parentUuid", "lastAssistantUuid", "uuid", "version",
 })
 TIMESTAMP_FIELDS = frozenset({"latestUserFrameAt", "lastTurnEdgeAt", "errorAt", "timestamp"})
 NUMBER_FIELDS = frozenset({"completedTurns"})
-BOOLEAN_FIELDS = frozenset({"lastTurnCutShort", "isArchived", "isSidechain"})
+BOOLEAN_FIELDS = frozenset({"lastTurnCutShort", "isArchived", "isSidechain", "isMeta", "isAbortedMidStream"})
 
 
 def _load_desktop_reader() -> Any:
@@ -130,6 +138,9 @@ class SelectedRootJSONReader(DESKTOP.StatusOnlyJSONReader):
         if index >= len(self.raw):
             raise MetadataError("missing_value")
         character = self.raw[index]
+        if root_field == "origin":
+            end, _ = super()._value(index, depth, root_field, nested_type)
+            return end, _ORIGIN_OBJECT if character == 123 else None
         if root_field == "message" and character == 123:
             return self._message_stop_reason(index, depth + 1)
         if root_field in STRING_FIELDS and character == 34:
@@ -141,35 +152,161 @@ class SelectedRootJSONReader(DESKTOP.StatusOnlyJSONReader):
             return self._primitive(index)
         return super()._value(index, depth, root_field, nested_type)
 
-    def _message_stop_reason(self, index: int, depth: int) -> tuple[int, dict[str, str | None]]:
+    def _message_stop_reason(self, index: int, depth: int) -> tuple[int, dict[str, Any]]:
         if depth > MAX_JSON_DEPTH:
             raise MetadataError("json_too_deep")
         index = self._space(index + 1)
         if index < len(self.raw) and self.raw[index] == 125:
-            return index + 1, {"stop_reason": None}
-        stop_reason: str | None = None
-        saw_stop_reason = False
+            return index + 1, {}
+        selected: dict[str, Any] = {}
+        seen_selected: set[bytes] = set()
+        message_fields = {b'"role"', b'"id"', b'"stop_reason"', b'"content"'}
         while True:
             key_start = index
             key_end = self._string_end(key_start)
             key_token = self.raw[key_start:key_end]
+            if b"\\" in key_token:
+                raise MetadataError("escaped_message_key")
             index = self._space(key_end)
             if index >= len(self.raw) or self.raw[index] != 58:
                 raise MetadataError("missing_colon")
             value_start = self._space(index + 1)
-            if key_token == b'"stop_reason"':
-                if saw_stop_reason:
+            if key_token in message_fields:
+                if key_token in seen_selected:
                     raise MetadataError("duplicate_selected_field")
-                saw_stop_reason = True
-                if value_start < len(self.raw) and self.raw[value_start] == 34:
-                    end, stop_reason = self._selected_string(value_start, 64)
+                seen_selected.add(key_token)
+                field_name = key_token[1:-1].decode("ascii")
+                if field_name in {"role", "id"}:
+                    if value_start < len(self.raw) and self.raw[value_start] == 34:
+                        end, value = self._selected_string(value_start, 128)
+                        selected[field_name] = value
+                    else:
+                        end, _ = super()._value(value_start, depth + 1)
+                        selected[field_name] = None
+                elif field_name == "stop_reason":
+                    selected["stop_reason_present"] = True
+                    selected["stop_reason_is_null"] = self.raw.startswith(b"null", value_start)
+                    if value_start < len(self.raw) and self.raw[value_start] == 34:
+                        end, value = self._selected_string(value_start, 64)
+                        selected["stop_reason"] = value
+                    else:
+                        end, _ = super()._value(value_start, depth + 1)
+                        selected["stop_reason"] = None
+                else:
+                    end, value = self._message_content(value_start, depth + 1)
+                    selected.update(value)
+            else:
+                end, _ = super()._value(value_start, depth + 1)
+            index = self._space(end)
+            if index < len(self.raw) and self.raw[index] == 125:
+                return index + 1, selected
+            if index >= len(self.raw) or self.raw[index] != 44:
+                raise MetadataError("invalid_object_separator")
+            index = self._space(index + 1)
+
+    def _message_content(self, index: int, depth: int) -> tuple[int, dict[str, Any]]:
+        if depth > MAX_JSON_DEPTH:
+            raise MetadataError("json_too_deep")
+        if index >= len(self.raw) or self.raw[index] != 91:
+            end, _ = super()._value(index, depth)
+            return end, {"content_is_array": False, "content_block_count": 0,
+                         "content_block_types": [], "standard_interrupt_exact": False,
+                         "tool_interrupt_exact": False}
+
+        index = self._space(index + 1)
+        block_types: list[str | None] = []
+        block_count = 0
+        standard_matches = 0
+        tool_matches = 0
+        if index < len(self.raw) and self.raw[index] == 93:
+            return index + 1, {"content_is_array": True, "content_block_count": 0,
+                               "content_block_types": [], "standard_interrupt_exact": False,
+                               "tool_interrupt_exact": False}
+
+        while True:
+            value_start = self._space(index)
+            if block_count >= MAX_MESSAGE_BLOCKS:
+                # Skip excess blocks so `stop_reason` can still support the
+                # independent completion counter guard. Marker matching fails
+                # closed once the message has more than one content block.
+                end, _ = super()._value(value_start, depth + 1)
+                block_count += 1
+            elif value_start < len(self.raw) and self.raw[value_start] == 123:
+                end, block = self._message_content_block(value_start, depth + 1)
+                block_types.append(block.get("type"))
+                standard_matches += bool(block.get("standard_interrupt_exact"))
+                tool_matches += bool(block.get("tool_interrupt_exact"))
+                block_count += 1
+            else:
+                end, _ = super()._value(value_start, depth + 1)
+                block_types.append(None)
+                block_count += 1
+            index = self._space(end)
+            if index < len(self.raw) and self.raw[index] == 93:
+                return index + 1, {
+                    "content_is_array": True,
+                    "content_block_count": block_count,
+                    "content_block_types": block_types,
+                    "standard_interrupt_exact": standard_matches == 1 and len(block_types) == 1,
+                    "tool_interrupt_exact": tool_matches == 1 and len(block_types) == 1,
+                }
+            if index >= len(self.raw) or self.raw[index] != 44:
+                raise MetadataError("invalid_array_separator")
+            index = self._space(index + 1)
+
+    def _message_content_block(self, index: int, depth: int) -> tuple[int, dict[str, Any]]:
+        if depth > MAX_JSON_DEPTH:
+            raise MetadataError("json_too_deep")
+        index = self._space(index + 1)
+        block_type: str | None = None
+        standard_interrupt_exact = False
+        tool_interrupt_exact = False
+        seen_selected: set[bytes] = set()
+        selected_fields = {b'"type"', b'"text"'}
+        if index < len(self.raw) and self.raw[index] == 125:
+            return index + 1, {"type": None}
+        while True:
+            key_start = index
+            key_end = self._string_end(key_start)
+            key_token = self.raw[key_start:key_end]
+            if b"\\" in key_token:
+                raise MetadataError("escaped_message_content_key")
+            index = self._space(key_end)
+            if index >= len(self.raw) or self.raw[index] != 58:
+                raise MetadataError("missing_colon")
+            value_start = self._space(index + 1)
+            if key_token in selected_fields:
+                if key_token in seen_selected:
+                    raise MetadataError("duplicate_selected_field")
+                seen_selected.add(key_token)
+                if key_token == b'"type"':
+                    if value_start < len(self.raw) and self.raw[value_start] == 34:
+                        end, block_type = self._selected_string(value_start, 64)
+                    else:
+                        end, _ = super()._value(value_start, depth + 1)
+                elif value_start < len(self.raw) and self.raw[value_start] == 34:
+                    end = self._string_end(value_start)
+                    standard_token = b'"' + STANDARD_INTERRUPT_MARKER + b'"'
+                    tool_token = b'"' + TOOL_INTERRUPT_MARKER + b'"'
+                    standard_interrupt_exact = (
+                        end - value_start == len(standard_token)
+                        and self.raw.startswith(standard_token, value_start)
+                    )
+                    tool_interrupt_exact = (
+                        end - value_start == len(tool_token)
+                        and self.raw.startswith(tool_token, value_start)
+                    )
                 else:
                     end, _ = super()._value(value_start, depth + 1)
             else:
                 end, _ = super()._value(value_start, depth + 1)
             index = self._space(end)
             if index < len(self.raw) and self.raw[index] == 125:
-                return index + 1, {"stop_reason": stop_reason}
+                return index + 1, {
+                    "type": block_type,
+                    "standard_interrupt_exact": standard_interrupt_exact and block_type == "text",
+                    "tool_interrupt_exact": tool_interrupt_exact and block_type == "text",
+                }
             if index >= len(self.raw) or self.raw[index] != 44:
                 raise MetadataError("invalid_object_separator")
             index = self._space(index + 1)
@@ -187,6 +324,20 @@ class SessionMetadata:
     error_category: str | None
     error_at: float | None
     last_assistant_uuid: str | None
+
+
+@dataclass(frozen=True)
+class JournalProjection:
+    latest_prompt_id: str | None = None
+    assistant_prompt_id: str | None = None
+    assistant_timestamp: float | None = None
+    cancellation_prompt_id: str | None = None
+    cancellation_timestamp: float | None = None
+    cancellation_signature: str | None = None
+    current_human_prompt_id: str | None = None
+    current_human_version_supported: bool = False
+    current_human_prompt_seen: bool = False
+    bytes_read: int = 0
 
 
 @dataclass(frozen=True)
@@ -217,6 +368,8 @@ class Cursor:
     hook_sequence: int = 0
     sequence: int = 0
     last_observed_at: str | None = None
+    last_interrupt_signature: str | None = None
+    active_interrupt_version_supported: bool = False
 
     def to_json(self) -> dict[str, Any]:
         return asdict(self)
@@ -239,6 +392,9 @@ class Cursor:
             for name in ("last_turn_cut_short", "is_archived", "error_category_present", "active_run_seen"):
                 if not isinstance(value.get(name), bool):
                     return None
+            active_interrupt_version_supported = value.get("active_interrupt_version_supported", False)
+            if not isinstance(active_interrupt_version_supported, bool):
+                return None
             if not isinstance(value.get("session_id"), str) or not LOCAL_SESSION_ID.fullmatch(value["session_id"]):
                 return None
             if not isinstance(value.get("cli_session_id"), str) or not IDENTIFIER.fullmatch(value["cli_session_id"]):
@@ -252,7 +408,19 @@ class Cursor:
             last_observed_at = value.get("last_observed_at")
             if last_observed_at is not None and not DESKTOP._bounded_string(last_observed_at, 80):
                 return None
-            return cls(**{name: value.get(name) for name in cls.__dataclass_fields__})
+            interrupt_signature = value.get("last_interrupt_signature")
+            if interrupt_signature is not None and (
+                not isinstance(interrupt_signature, str)
+                or not re.fullmatch(r"[0-9a-f]{64}", interrupt_signature)
+            ):
+                return None
+            return cls(**{
+                name: value.get(
+                    name,
+                    False if name == "active_interrupt_version_supported" else None,
+                )
+                for name in cls.__dataclass_fields__
+            })
         except (KeyError, TypeError, ValueError):
             return None
 
@@ -500,27 +668,29 @@ def _journal_prompt_id(
     latest_user_frame_at: float | None,
     last_assistant_uuid: str | None,
     remaining_budget: int,
-) -> tuple[str | None, str | None, float | None, int]:
+    tracked_prompt_id: str | None = None,
+    tracked_version_supported: bool = False,
+) -> JournalProjection:
     try:
         info = path.lstat()
     except OSError:
-        return None, None, None, 0
+        return JournalProjection()
     if not stat.S_ISREG(info.st_mode) or stat.S_ISLNK(info.st_mode):
-        return None, None, None, 0
+        return JournalProjection()
     window_size = min(info.st_size, MAX_JOURNAL_BYTES, remaining_budget)
     if window_size <= 0:
-        return None, None, None, 0
+        return JournalProjection()
     flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0)
     try:
         descriptor = os.open(path, flags)
     except OSError:
-        return None, None, None, 0
+        return JournalProjection()
     try:
         current = os.fstat(descriptor)
         if (not stat.S_ISREG(current.st_mode) or current.st_dev != info.st_dev
                 or current.st_ino != info.st_ino or current.st_size != info.st_size
                 or current.st_mtime_ns != info.st_mtime_ns):
-            return None, None, None, 0
+            return JournalProjection()
         start = max(0, current.st_size - window_size)
         os.lseek(descriptor, start, os.SEEK_SET)
         raw = bytearray()
@@ -533,21 +703,38 @@ def _journal_prompt_id(
         if (len(raw) != window_size
                 or (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns)
                 != (current.st_dev, current.st_ino, current.st_size, current.st_mtime_ns)):
-            return None, None, None, 0
+            return JournalProjection()
     finally:
         os.close(descriptor)
     data = bytes(raw)
     if start > 0:
         newline = data.find(b"\n")
         data = b"" if newline < 0 else data[newline + 1:]
+    # A growing final record is never treated as evidence until its newline
+    # commits the record to the JSONL journal.
+    if data and not data.endswith(b"\n"):
+        newline = data.rfind(b"\n")
+        data = b"" if newline < 0 else data[:newline + 1]
     bytes_read = len(raw)
     latest_prompt: str | None = None
+    current_human_prompt: str | None = None
+    current_human_version_supported = False
+    current_human_prompt_seen = False
     assistant_prompt: str | None = None
     assistant_timestamp: float | None = None
+    cancellation_prompt: str | None = None
+    cancellation_timestamp: float | None = None
+    cancellation_signature: str | None = None
     prompt_by_uuid: dict[str, str] = {}
+    assistant_by_uuid: dict[str, dict[str, Any]] = {}
+    records_read = 0
     for line in data.splitlines():
         if not line:
             continue
+        records_read += 1
+        if records_read > MAX_JOURNAL_RECORDS_PER_LOOKUP:
+            # Do not make decisions from only the beginning of a bounded tail.
+            return JournalProjection(bytes_read=bytes_read)
         try:
             fields, _ = SelectedRootJSONReader(line, JOURNAL_FIELDS).parse()
         except MetadataError:
@@ -562,20 +749,122 @@ def _journal_prompt_id(
         parent_uuid = _identifier(fields.get("parentUuid"))
         record_prompt = prompt_id or (prompt_by_uuid.get(parent_uuid) if parent_uuid else None)
         timestamp = _timestamp(fields.get("timestamp"))
+
+        message = fields.get("message") if isinstance(fields.get("message"), dict) else {}
+        content_types = message.get("content_block_types")
+        human_prompt_record = (
+            fields.get("type") == "user"
+            and fields.get("sessionId") == cli_session_id
+            and fields.get("isSidechain") is False
+            and fields.get("isMeta") is not True
+            and fields.get("origin") is _ORIGIN_OBJECT
+            and "toolUseResult" not in fields
+            and message.get("role") == "user"
+        )
+        content_types_complete = (
+            isinstance(content_types, list)
+            and message.get("content_block_count") == len(content_types)
+        )
+        if (human_prompt_record and content_types_complete
+                and "tool_result" not in content_types):
+            current_human_prompt_seen = True
+            current_human_prompt = prompt_id
+            current_human_version_supported = (
+                fields.get("version") == SUPPORTED_CANCELLATION_CLI_VERSION
+            )
+        elif human_prompt_record and not content_types_complete:
+            # The block cap may have hidden a tool-result child. Treat the
+            # current human prompt as unresolved so an older tracked prompt
+            # cannot fall back to cancellation evidence from the truncated tail.
+            current_human_prompt_seen = True
+            current_human_prompt = None
+            current_human_version_supported = False
+
+        if (fields.get("type") == "user"
+                and latest_user_frame_at is not None
+                and timestamp is not None and prompt_id is not None
+                and abs(timestamp - latest_user_frame_at) <= TIMESTAMP_MATCH_TOLERANCE_SECONDS):
+            latest_prompt = prompt_id
+            record_prompt = prompt_id
+
         if uuid is not None and record_prompt is not None:
             prompt_by_uuid[uuid] = record_prompt
-        if fields.get("type") == "user":
-            if (latest_user_frame_at is not None and timestamp is not None and prompt_id is not None
-                    and abs(timestamp - latest_user_frame_at) <= TIMESTAMP_MATCH_TOLERANCE_SECONDS):
-                latest_prompt = prompt_id
-        elif (fields.get("type") == "assistant" and uuid == last_assistant_uuid
+        if fields.get("type") == "assistant" and uuid is not None:
+            assistant_by_uuid[uuid] = {
+                "session_id": session_id,
+                "prompt_id": record_prompt,
+                "is_sidechain": fields.get("isSidechain"),
+                "is_meta": fields.get("isMeta"),
+                "is_aborted_mid_stream": fields.get("isAbortedMidStream"),
+                "version": fields.get("version"),
+                "message_role": message.get("role"),
+                "message_id": _identifier(message.get("id")),
+                "stop_reason_is_null": message.get("stop_reason_is_null") is True,
+                "timestamp": timestamp,
+            }
+
+        if (cancellation_signature is None
+                and fields.get("type") == "user"
+                and fields.get("sessionId") == cli_session_id
+                and fields.get("isSidechain") is False
+                and fields.get("isMeta") is not True
+                and "origin" not in fields
+                and fields.get("version") == SUPPORTED_CANCELLATION_CLI_VERSION
+                and "toolUseResult" not in fields
+                and message.get("role") == "user"
+                and message.get("content_is_array") is True
+                and message.get("content_block_count") == 1
+                and message.get("content_block_types") == ["text"]
+                and message.get("standard_interrupt_exact") is True
+                and message.get("tool_interrupt_exact") is False
+                and prompt_id is not None
+                and ((current_human_prompt_seen and prompt_id == current_human_prompt
+                      and current_human_version_supported
+                      and (prompt_id == latest_prompt or prompt_id == tracked_prompt_id))
+                     or (not current_human_prompt_seen and tracked_prompt_id is not None
+                         and tracked_version_supported
+                         and prompt_id == tracked_prompt_id))
+                and uuid is not None and parent_uuid is not None
+                and timestamp is not None
+                and latest_user_frame_at is not None
+                and timestamp >= latest_user_frame_at):
+            parent = assistant_by_uuid.get(parent_uuid)
+            if (parent is not None
+                    and parent.get("session_id") == cli_session_id
+                    and (parent.get("prompt_id") == prompt_id
+                         or (parent.get("prompt_id") is None and tracked_prompt_id == prompt_id))
+                    and parent.get("is_sidechain") is False
+                    and parent.get("is_meta") is not True
+                    and parent.get("is_aborted_mid_stream") is True
+                    and parent.get("version") == SUPPORTED_CANCELLATION_CLI_VERSION
+                    and parent.get("message_role") == "assistant"
+                    and parent.get("message_id") is not None
+                    and parent.get("stop_reason_is_null") is True):
+                cancellation_prompt = prompt_id
+                cancellation_timestamp = timestamp
+                cancellation_signature = _sha256(
+                    "claude-code-user-interrupt-v1", cli_session_id,
+                    prompt_id, uuid, parent_uuid,
+                )
+
+        if (fields.get("type") == "assistant" and uuid == last_assistant_uuid
               and last_assistant_uuid is not None
               and timestamp is not None
-              and isinstance(fields.get("message"), dict)
-              and fields["message"].get("stop_reason") == "end_turn"):
+              and message.get("stop_reason") == "end_turn"):
             assistant_prompt = record_prompt
             assistant_timestamp = timestamp
-    return latest_prompt, assistant_prompt, assistant_timestamp, bytes_read
+    return JournalProjection(
+        latest_prompt_id=latest_prompt,
+        assistant_prompt_id=assistant_prompt,
+        assistant_timestamp=assistant_timestamp,
+        cancellation_prompt_id=cancellation_prompt,
+        cancellation_timestamp=cancellation_timestamp,
+        cancellation_signature=cancellation_signature,
+        current_human_prompt_id=current_human_prompt,
+        current_human_version_supported=current_human_version_supported,
+        current_human_prompt_seen=current_human_prompt_seen,
+        bytes_read=bytes_read,
+    )
 
 
 def _frame_is_fresh(frame_at: float | None, now_epoch: float) -> bool:
@@ -739,14 +1028,22 @@ class ClaudeCodeRecordsReader:
                     self.agent_watch_root, metadata.cli_session_id
                 )
 
-            prompt_id: str | None = None
-            assistant_prompt_id: str | None = None
-            assistant_timestamp: float | None = None
+            journal_projection = JournalProjection()
             mapping_unresolved = (
                 prior is not None
                 and metadata.latest_user_frame_at is not None
                 and _frame_is_fresh(metadata.latest_user_frame_at, now_epoch)
                 and prior.turn_id == _turn_id(metadata.cli_session_id, metadata.latest_user_frame_at)
+            )
+            cancellation_probe_due = (
+                prior is not None
+                and prior.active_run_seen
+                and prior.turn_id is not None
+                and prior.active_frame_at is not None
+                and metadata.latest_user_frame_at is not None
+                and metadata.latest_user_frame_at == prior.latest_user_frame_at
+                and metadata.latest_user_frame_at == prior.active_frame_at
+                and not metadata.is_archived
             )
             needs_turn_mapping = prior is None or (
                 (metadata.latest_user_frame_at is not None
@@ -755,29 +1052,40 @@ class ClaudeCodeRecordsReader:
                 or metadata.completed_turns > prior.completed_turns
                 or metadata.last_assistant_uuid != prior.last_assistant_uuid
                 or mapping_unresolved
+                or cancellation_probe_due
             )
             journal_frame = metadata.latest_user_frame_at
             if journal_frame is None and prior is not None:
                 journal_frame = prior.latest_user_frame_at
-            if (needs_turn_mapping and not metadata.is_archived
-                    and journal_lookups < 8 and journal_budget > 0):
+            if needs_turn_mapping and not metadata.is_archived:
                 if journal_index is None:
                     journal_index, journal_diagnostic = _journal_index(self.home)
                     if journal_diagnostic == "journal_index_limited":
                         summary.diagnostic = "scan_limited"
                     elif journal_diagnostic == "journal_index_error":
                         summary.diagnostic = "directory_scan_error"
-                journal_path = journal_index.get(metadata.cli_session_id)
+                journal_path = journal_index.get(metadata.cli_session_id) if journal_index is not None else None
                 if journal_path is not None:
-                    prompt_id, assistant_prompt_id, assistant_timestamp, bytes_read = _journal_prompt_id(
+                    if (journal_lookups >= MAX_JOURNAL_LOOKUPS_PER_POLL
+                            or journal_budget <= 0):
+                        if summary.diagnostic == "none":
+                            summary.diagnostic = "scan_limited"
+                        stop_before_current = True
+                        break
+                    journal_projection = _journal_prompt_id(
                         journal_path,
                         metadata.cli_session_id,
                         journal_frame,
                         metadata.last_assistant_uuid,
                         journal_budget,
+                        tracked_prompt_id=prior.turn_id if cancellation_probe_due else None,
+                        tracked_version_supported=(
+                            prior.active_interrupt_version_supported
+                            if cancellation_probe_due and prior is not None else False
+                        ),
                     )
                     journal_lookups += 1
-                    journal_budget -= bytes_read
+                    journal_budget -= journal_projection.bytes_read
 
             plans, next_cursor = _reduce_snapshot(
                 metadata=metadata,
@@ -786,9 +1094,15 @@ class ClaudeCodeRecordsReader:
                 now=now,
                 hook_turn_id=hook_turn_id,
                 hook_sequence=hook_sequence,
-                journal_prompt_id=prompt_id,
-                assistant_prompt_id=assistant_prompt_id,
-                assistant_timestamp=assistant_timestamp,
+                journal_prompt_id=journal_projection.latest_prompt_id,
+                assistant_prompt_id=journal_projection.assistant_prompt_id,
+                assistant_timestamp=journal_projection.assistant_timestamp,
+                journal_cancel_prompt_id=journal_projection.cancellation_prompt_id,
+                journal_cancel_timestamp=journal_projection.cancellation_timestamp,
+                journal_cancel_signature=journal_projection.cancellation_signature,
+                journal_human_prompt_id=journal_projection.current_human_prompt_id,
+                journal_human_version_supported=journal_projection.current_human_version_supported,
+                journal_human_prompt_seen=journal_projection.current_human_prompt_seen,
             )
             if metadata.is_archived:
                 self.cursors[key] = next_cursor
@@ -910,6 +1224,12 @@ def _reduce_snapshot(
     journal_prompt_id: str | None,
     assistant_prompt_id: str | None,
     assistant_timestamp: float | None,
+    journal_cancel_prompt_id: str | None,
+    journal_cancel_timestamp: float | None,
+    journal_cancel_signature: str | None,
+    journal_human_prompt_id: str | None,
+    journal_human_version_supported: bool,
+    journal_human_prompt_seen: bool,
 ) -> tuple[list[PlannedEvent], Cursor]:
     now_epoch = now.timestamp()
     plans: list[PlannedEvent] = []
@@ -920,7 +1240,15 @@ def _reduce_snapshot(
         active_run_seen: bool,
         sequence: int,
         last_observed_at: str | None,
+        last_interrupt_signature: str | None = None,
+        active_interrupt_version_supported: bool | None = None,
     ) -> Cursor:
+        if last_interrupt_signature is None and prior is not None:
+            last_interrupt_signature = prior.last_interrupt_signature
+        if active_interrupt_version_supported is None:
+            active_interrupt_version_supported = (
+                prior.active_interrupt_version_supported if prior is not None else False
+            )
         return Cursor(
             device=info.st_dev,
             inode=info.st_ino,
@@ -942,6 +1270,8 @@ def _reduce_snapshot(
             hook_sequence=max(hook_sequence, prior.hook_sequence if prior is not None else 0),
             sequence=sequence,
             last_observed_at=last_observed_at,
+            last_interrupt_signature=last_interrupt_signature,
+            active_interrupt_version_supported=active_interrupt_version_supported,
         )
 
     def plan(state: str, evidence: str, source_field: str, signature: str,
@@ -971,6 +1301,20 @@ def _reduce_snapshot(
     ) if current_frame is not None else None
 
     if prior is None:
+        bootstrap_interrupt_signature = None
+        bootstrap_interrupted = (
+            journal_cancel_signature is not None
+                and journal_cancel_prompt_id is not None
+                and journal_cancel_prompt_id == journal_prompt_id
+                and current_frame is not None
+                and journal_cancel_timestamp is not None
+                and journal_cancel_timestamp >= current_frame
+                and _fresh_timestamp(journal_cancel_timestamp, now_epoch)
+        )
+        if bootstrap_interrupted:
+            # A cancel already present during bootstrap is history. Remember its
+            # opaque signature so it cannot be replayed as a new cancellation.
+            bootstrap_interrupt_signature = journal_cancel_signature
         already_complete = (
             journal_prompt_id is not None
             and assistant_prompt_id == journal_prompt_id
@@ -978,7 +1322,13 @@ def _reduce_snapshot(
             and current_frame is not None
             and current_edge >= current_frame
         )
-        active = not metadata.is_archived and frame_fresh and not already_complete
+        active = not metadata.is_archived and frame_fresh and not already_complete and not bootstrap_interrupted
+        active_interrupt_version_supported = (
+            active
+            and journal_human_prompt_seen
+            and journal_human_prompt_id == turn_id
+            and journal_human_version_supported
+        )
         if active and turn_id is not None:
             plan("running", "inferred", "latestUserFrameAt", f"frame:{current_frame:.6f}",
                  turn_id, current_frame)
@@ -988,6 +1338,8 @@ def _reduce_snapshot(
             active_run_seen=active,
             sequence=0,
             last_observed_at=None,
+            last_interrupt_signature=bootstrap_interrupt_signature,
+            active_interrupt_version_supported=active_interrupt_version_supported,
         )
 
     regressed = metadata.completed_turns < prior.completed_turns
@@ -998,12 +1350,14 @@ def _reduce_snapshot(
         return plans, make_cursor(
             turn_id=None, active_frame_at=None, active_run_seen=False,
             sequence=prior.sequence, last_observed_at=prior.last_observed_at,
+            active_interrupt_version_supported=False,
         )
 
     if metadata.is_archived:
         return plans, make_cursor(
             turn_id=None, active_frame_at=None, active_run_seen=False,
             sequence=prior.sequence, last_observed_at=prior.last_observed_at,
+            active_interrupt_version_supported=False,
         )
 
     edge_advanced = current_edge is not None and (
@@ -1051,9 +1405,38 @@ def _reduce_snapshot(
                 completion_turn, now.timestamp(),
             )
 
+    cancellation_turn: str | None = None
+    cancellation_evidence_is_current = (
+        prior_active
+        and not frame_advanced
+        and current_frame is not None
+        and prior.latest_user_frame_at == current_frame
+        and prior.active_frame_at == current_frame
+        and prior.turn_id is not None
+        and journal_cancel_prompt_id is not None
+        and (journal_cancel_prompt_id == journal_prompt_id
+             or (journal_prompt_id is None and journal_cancel_prompt_id == prior.turn_id))
+        and journal_cancel_timestamp is not None
+        and journal_cancel_timestamp >= prior.active_frame_at
+        and _fresh_timestamp(journal_cancel_timestamp, now_epoch)
+        and journal_cancel_signature is not None
+        and journal_cancel_signature != prior.last_interrupt_signature
+        and not completed_advanced
+        and failure_turn is None
+        and not fresh_error
+        and completion_turn is None
+    )
+    if cancellation_evidence_is_current:
+        cancellation_turn = prior.turn_id
+        plan(
+            "cancelled", "explicit", "journal_user_interrupt",
+            f"interrupt:{journal_cancel_signature}", cancellation_turn,
+            journal_cancel_timestamp,
+        )
+
     unknown_turn: str | None = None
     if (metadata.last_turn_cut_short and edge_advanced and prior_active
-            and not completion_turn and failure_turn is None):
+            and not completion_turn and cancellation_turn is None and failure_turn is None):
         if (not frame_advanced and current_edge is not None
                 and prior.active_frame_at is not None and current_edge >= prior.active_frame_at):
             unknown_turn = prior.turn_id
@@ -1068,14 +1451,32 @@ def _reduce_snapshot(
     active_frame = prior.active_frame_at if prior_active else None
     active_turn = prior.turn_id if prior_active else turn_id
     active = prior_active
+    active_interrupt_version_supported = prior.active_interrupt_version_supported
     if frame_advanced:
         active = frame_fresh and turn_id is not None
         active_frame = current_frame if active else None
         active_turn = turn_id
+        active_interrupt_version_supported = (
+            active
+            and journal_human_prompt_seen
+            and journal_human_prompt_id == turn_id
+            and journal_human_version_supported
+        )
+    elif prior_active and journal_human_prompt_seen:
+        active_interrupt_version_supported = (
+            journal_human_prompt_id == prior.turn_id
+            and journal_human_version_supported
+        )
     for event in plans:
-        if event.state in {"failed", "responseEnded", "unknown"} and event.turn_id == active_turn:
+        if event.state in {"failed", "responseEnded", "cancelled"} and event.turn_id == active_turn:
             active = False
             active_frame = None
+            active_interrupt_version_supported = False
+        elif (event.state == "unknown" and event.turn_id == active_turn
+              and not event.source.endswith("lastTurnCutShort_unclassified")):
+            active = False
+            active_frame = None
+            active_interrupt_version_supported = False
     if not active and active_turn is None:
         active_turn = turn_id
     return plans, make_cursor(
@@ -1084,6 +1485,11 @@ def _reduce_snapshot(
         active_run_seen=active,
         sequence=prior.sequence,
         last_observed_at=prior.last_observed_at,
+        last_interrupt_signature=(
+            journal_cancel_signature
+            if cancellation_evidence_is_current else None
+        ),
+        active_interrupt_version_supported=active_interrupt_version_supported,
     )
 
 
