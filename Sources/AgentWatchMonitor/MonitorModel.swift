@@ -284,14 +284,13 @@ final class MonitorModel: NSObject, ObservableObject, UNUserNotificationCenterDe
             content.sound = .default
             content.userInfo = ["appID": notice.appID]
             let request = UNNotificationRequest(identifier: UUID().uuidString, content: content, trigger: nil)
-            center.add(request) { [weak self] error in
-                let outcome = error.map { "failed_code_\(($0 as NSError).code)" } ?? "accepted_by_system"
-                Task { @MainActor [weak self] in
-                    guard let self else { return }
-                    self.diagnostics["notification_last_request"] = outcome
-                    _ = self.persistSnapshot()
-                }
+            do {
+                try await center.add(request)
+                self.diagnostics["notification_last_request"] = "accepted_by_system"
+            } catch {
+                self.diagnostics["notification_last_request"] = "failed_code_\((error as NSError).code)"
             }
+            _ = self.persistSnapshot()
         }
     }
 
