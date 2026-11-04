@@ -44,6 +44,7 @@ final class MonitorModel: NSObject, ObservableObject, UNUserNotificationCenterDe
            let saved = try? JSONDecoder().decode(CompletionInbox.self, from: data) {
             completions = saved
             completions.remove(appID: "demo")
+            completions.remove(appID: "doubao")
         }
         let enginePath = supportDirectory.appendingPathComponent("engine.json")
         if let size = try? enginePath.resourceValues(forKeys: [.fileSizeKey]).fileSize, size < 64 * 1024 * 1024,
