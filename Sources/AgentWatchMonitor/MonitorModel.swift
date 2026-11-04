@@ -328,7 +328,7 @@ final class MonitorModel: NSObject, ObservableObject, UNUserNotificationCenterDe
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
         encoder.dateEncodingStrategy = .iso8601
-        return try encoder.encode(Export(version: "0.3.2-preview", collectedAt: Date(), demoIncluded: demo,
+        return try encoder.encode(Export(version: "0.3.3-preview", collectedAt: Date(), demoIncluded: demo,
                                          statusBar: barText, unreadCompletions: completionCount,
                                          accessibilityTrusted: AXIsProcessTrusted(), notificationsEnabled: notificationsEnabled,
                                          paused: paused, windowObservation: windowObservation,

@@ -1,6 +1,6 @@
 # Agent Watch
 
-本地运行的 macOS 智能体监控器。当前源码为 **0.3.2 预览候选版**：已有持续采集、会话状态、动态菜单栏、可贴边悬浮面板、系统通知、状态导出和打开原应用入口。候选版通过自动检查后，仍须完成原生客户端验收。
+本地运行的 macOS 智能体监控器。当前源码为 **0.3.3 预览候选版**：已有持续采集、会话状态、动态菜单栏、可贴边悬浮面板、系统通知、状态导出和打开原应用入口。候选版通过自动检查后，仍须完成原生客户端验收。
 
 **八款目标应用尚未全部通过真实任务验收。** “已安装适配器”“窗口可访问”和“实际识别任务状态”分别记录，不把候选规则当成已验证兼容。
 
@@ -12,19 +12,20 @@
 - 状态栏动态显示运行、待处理、新结束；展开后列出近期会话、持续时间和打开应用入口。悬浮小面板可固定在屏幕边缘。
 - 各应用独立观察：窗口路径匹配受限控件和固定状态词，输入值、聊天内容和窗口标题不进入历史记录；推断单独标注。窗口内不可见的其他会话不保证覆盖；停止按钮消失不能证明正常完成。
 - Codex 本地生命周期日志、Claude Code 成功计数与准确轮次映射、Claude 本地 Chat/Cowork 审计读取器；另有 WorkBuddy 事件桥、DSH 插件、Antigravity 和 Devin 接入。
-- 旧版 Codex/Claude Code Stop 仅作为待确认信号；升级时迁移能准确识别的旧误判，不清空其他应用的提醒。
+- 旧版 Codex/Claude Code Stop 及 Devin 早到回调仅作为待确认信号；升级时精确迁移这些来源的旧误判。
+- 可信程度与身份寿命分别处理：稳定会话的推断记录可跨重启恢复，临时窗口重新发现；状态不变时减少重复写盘。通知诊断区分“系统接受请求”与实际弹出横幅。
 - 点击“打开应用”只激活对应应用；尚不能精确跳转到隐藏会话。
 
 ## 接入状态
 
 | 目标 | 已实现路径 | 本机验证与限制 |
 | --- | --- | --- |
-| Claude Code | hooks + 本地成功计数 + 日志轮次映射 | 4.4212.0 Gateway/API 的 Sonnet Low 已实测同一轮次运行→成功计数增加→结束；Stop 不作为完成，取消的精确分类仍有限制 |
+| Claude Code | hooks + 本地成功计数 + 日志轮次映射 | 4.4212.0 Gateway/API 的 Sonnet Low 已实测同一轮次运行→成功计数增加→结束；Stop 不作为完成；CLI 2.1.309 的部分流取消有严格标记契约，工具拒绝等其他情形仍有限制 |
 | Claude Chat / Cowork | 两种本地配置目录、完整/缩短任务目录、审计流；Cowork 中断窗口补充 | 4.4212.0 的 API Cowork 已实测运行、等待回答、回答后继续和成功结果；中断补丁的原生闭环仍待验收。普通 Chat 仅通过合成记录验证 |
 | Codex | hooks + 只读本地生命周期日志；可选本地服务桥 | 日志中的 task/turn complete 确认轮次结束，支持追加、重启和子任务；Stop 意图不再锁定终态。普通 ChatGPT 不沿用 Codex 结论 |
 | WorkBuddy | hooks + 窗口候选规则 | 已在界面报告 V5.9.3 的客户端收到真实 UserPromptSubmit 与 Stop |
 | DSH | 0.2.1-rc.5 只读插件 + 窗口候选规则 | 0.1.1 已通过原生管理器安装启用；独立验收已捕获等待回答及回答后的正常结束 |
-| Gemini 桌面版 | 原生专用连续观察、消息区域与侧栏隔离 | 已实现新回复尾部控件确认及取消/切换保护；合成检查通过，当前客户端后台与最小化闭环仍待验收 |
+| Gemini 桌面版 | 原生专用连续观察、消息区域与侧栏隔离 | 0.3.2 实际后台测试漏掉结束提醒，失败记录已保留。0.3.3 修复瞬断身份丢失、最新消息选择并增加角色诊断；组合检查和新包实测仍待完成 |
 | 豆包 | 主进程/浏览器子进程验证、辅助功能兼容和窗口发现 | 2.24.10 当前暴露结构仍不足；最近会话库未验证出任务生命周期。运行、等待与结束尚未形成可靠覆盖 |
 | Antigravity | 桌面事件桥 + 问答工具观察 | 2.28.2 已实测运行、等待回答、回答后继续及正常结束；原生取消未收到 Stop，超时转未知 |
 | Devin | 新 Local 事件桥 | 3.11.228 已实测运行、等待授权及拒绝后解除等待；Stop 与旧 post 回调均不能证明最终结束，保留未知；Cloud 未接入 |
@@ -74,7 +75,7 @@ Antigravity 的安装与范围见 [ANTIGRAVITY.md](adapters/ANTIGRAVITY.md)，�
 
 ## English
 
-Agent Watch is a local-first macOS agent monitor. The source is a 0.3.2 preview candidate with a dynamic menu bar, an edge panel, a persistent state machine, metadata-only lifecycle readers, conservative window inference, notifications, and local status export.
+Agent Watch is a local-first macOS agent monitor. The source is a 0.3.3 preview candidate with a dynamic menu bar, an edge panel, a persistent state machine, metadata-only lifecycle readers, conservative window inference, notifications, and local status export.
 
 **It has not passed end-to-end acceptance for all eight desktop products.** Claude Code and API Cowork have live lifecycle evidence on 4.4212.0 using Sonnet Low. Codex now confirms completion from its lifecycle journal; Stop hooks alone are not completion evidence. DSH and WorkBuddy have earlier live activity/turn-end receipts. Antigravity 2.28.2 also passed a real question-and-answer lifecycle, while its native cancellation callback was not observed. Other integrations are explicitly marked as installed, fixture-tested, inferred, blocked, or unverified in the matrix above. CLI support never implies desktop support. Hidden conversations are not guaranteed by window observation.
 

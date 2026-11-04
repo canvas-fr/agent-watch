@@ -28,7 +28,7 @@ root=Path(sys.argv[1])
 with (root/'Contents/Info.plist').open('wb') as stream:
     plistlib.dump({'CFBundleIdentifier':'local.agentwatch.monitor','CFBundleName':'Agent Watch',
       'CFBundleDisplayName':'Agent Watch','CFBundleExecutable':'AgentWatch',
-      'CFBundlePackageType':'APPL','CFBundleShortVersionString':'0.3.2','CFBundleVersion':'6',
+      'CFBundlePackageType':'APPL','CFBundleShortVersionString':'0.3.3','CFBundleVersion':'7',
       'LSMinimumSystemVersion':'14.0','NSHighResolutionCapable':True},stream)
 PY
 codesign --force --sign "${AGENT_WATCH_SIGN_IDENTITY:--}" "$stage/Agent Watch.app"
