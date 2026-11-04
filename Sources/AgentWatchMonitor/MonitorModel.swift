@@ -11,6 +11,7 @@ final class MonitorModel: NSObject, ObservableObject, UNUserNotificationCenterDe
     @Published var runningApps = Set<String>()
     @Published var lastScan: Date?
     @Published var paused = false
+    @Published var dashboardPage = "all"
     @Published var windowObservation = false
     @Published var notifyInferred = false
     @Published var notifyWindowCompletions = false
@@ -35,10 +36,34 @@ final class MonitorModel: NSObject, ObservableObject, UNUserNotificationCenterDe
     private var engineCache = SnapshotFileCache()
     private var completionCache = SnapshotFileCache()
 
-    override init() {
+    override convenience init() { self.init(preview: false) }
+
+    init(preview: Bool) {
         supportDirectory = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Library/Application Support/Agent Watch")
         collector = MonitorCollector(directory: supportDirectory.appendingPathComponent("events"))
         super.init()
+        // Development previews use synthetic metadata and never start collectors,
+        // touch user state, request permissions, or send system notifications.
+        if preview {
+            let now = Date()
+            sessions = [
+                ("claude_code", "review-session", SessionState.waitingApproval, EvidenceKind.explicit, 132.0),
+                ("codex", "build-session", .running, .explicit, 248.0),
+                ("dsh", "question-session", .waitingInput, .explicit, 64.0),
+                ("antigravity", "complete-session", .responseEnded, .explicit, 37.0),
+                ("gemini", "window-session", .unknown, .inferred, 18.0)
+            ].map { app, session, state, evidence, elapsed in
+                SessionSnapshot(appID: app, sessionID: session, turnID: "preview-turn", state: state,
+                    evidence: evidence, updatedAt: now.addingTimeInterval(-elapsed), source: "synthetic_preview",
+                    parentSessionID: nil, stale: false)
+            }
+            runningApps = ["claude", "codex", "dsh", "antigravity", "gemini"]
+            completions.record(appID: "antigravity", sessionID: "complete-session", turnID: "preview-turn")
+            demo = true
+            lastScan = now
+            statusMessage = "界面预览 · 合成数据，未运行采集器"
+            return
+        }
         let completionPath = supportDirectory.appendingPathComponent("completions.json")
         if let data = try? Data(contentsOf: completionPath), data.count < 100_000,
            let saved = try? JSONDecoder().decode(CompletionInbox.self, from: data) {
@@ -341,7 +366,7 @@ final class MonitorModel: NSObject, ObservableObject, UNUserNotificationCenterDe
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
         encoder.dateEncodingStrategy = .iso8601
-        return try encoder.encode(Export(version: "0.3.3-preview", collectedAt: Date(), demoIncluded: demo,
+        return try encoder.encode(Export(version: "0.4.0-preview", collectedAt: Date(), demoIncluded: demo,
                                          statusBar: barText, unreadCompletions: completionCount,
                                          accessibilityTrusted: AXIsProcessTrusted(), notificationsEnabled: notificationsEnabled,
                                          paused: paused, windowObservation: windowObservation,

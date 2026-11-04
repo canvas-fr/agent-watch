@@ -1,8 +1,10 @@
 # Agent Watch
 
-本地运行的 macOS 智能体监控器。当前源码为 **0.3.3 预览候选版**：已有持续采集、会话状态、动态菜单栏、可贴边悬浮面板、系统通知、状态导出和打开原应用入口。候选版通过自动检查后，仍须完成原生客户端验收。
+[English](README.en.md) · [界面预览](docs/INTERFACE.zh-CN.md) · [安装说明](docs/INSTALLATION.md) · [发布说明](docs/RELEASE-NOTES-0.4.0-preview.8.md)
 
-**当前版移除豆包，冻结新接入。Gemini 与 Devin 为实验项，尚未全部通过真实任务验收。** “已安装适配器”“窗口可访问”和“实际识别任务状态”分别记录，不把候选规则当成已验证兼容。
+本地运行的 macOS 智能体监控器。当前源码版本为 **0.4.0 Preview（Build 8）**：包含持续采集、会话状态、动态菜单栏、可贴边悬浮面板、系统通知、状态导出和打开原应用入口。本版本为预览版；各客户端的验收状态和限制见下表。
+
+**当前版移除豆包，冻结新接入。Gemini 与 Devin 为实验项，尚未全部通过真实任务验收。** 实验窗口观察默认关闭。“已安装适配器”“窗口可访问”和“实际识别任务状态”分别记录，不把候选规则当成已验证兼容。
 
 ## 当前能力
 
@@ -41,6 +43,8 @@ open "dist/Agent Watch.app"
 
 构建目录可通过 `AGENT_WATCH_BUILD_DIR` 指定。若有合适的签名身份，可设置 `AGENT_WATCH_SIGN_IDENTITY`；默认仅本地临时签名，更新后 macOS 可能要求重新授权，见 [权限说明](docs/PERMISSIONS.zh-CN.md)。构建脚本拒绝覆盖已有应用。
 
+本地生成 DMG、app ZIP、指定 commit 的 source ZIP、校验和与发布清单，请按 [发布打包说明](docs/RELEASING.md) 执行。打包默认 ad hoc 签名，不会上传或发布公网。
+
 默认只采集事件和本地会话记录，不要求辅助功能授权。实验窗口观察默认关闭，手动启用后才需要对应系统权限；授权缺失时，事件桥仍可接收事件。首次使用“开启系统通知”会请求系统授权。窗口推断及 Gemini 结束提醒均默认关闭；关闭后不新增该类未读结束标记。演示按钮只注入明确标记的本地演示数据，不代表真实应用接入；可清除演示。
 
 ## 安装事件桥
@@ -70,11 +74,11 @@ Antigravity 的安装与范围见 [ANTIGRAVITY.md](adapters/ANTIGRAVITY.md)，�
 
 ## 开发文档
 
-[开发计划](docs/PLAN.zh-CN.md) · [验收矩阵](docs/ACCEPTANCE.zh-CN.md) · [贡献指南](CONTRIBUTING.md) · [权限排查](docs/PERMISSIONS.zh-CN.md) · [Codex 日志](adapters/CODEX-JOURNAL.md) · [Claude Code 记录](adapters/CLAUDE-CODE-RECORDS.md) · [Claude Chat/Cowork](adapters/CLAUDE-DESKTOP.md)
+[开发计划](docs/PLAN.zh-CN.md) · [验收矩阵](docs/ACCEPTANCE.zh-CN.md) · [发布打包](docs/RELEASING.md) · [版本记录](docs/CHANGELOG.md) · [贡献指南](CONTRIBUTING.md) · [权限排查](docs/PERMISSIONS.zh-CN.md) · [Codex 日志](adapters/CODEX-JOURNAL.md) · [Claude Code 记录](adapters/CLAUDE-CODE-RECORDS.md) · [Claude Chat/Cowork](adapters/CLAUDE-DESKTOP.md)
 
 ## English
 
-Agent Watch is a local-first macOS agent monitor. The source is a 0.3.3 preview candidate with a dynamic menu bar, an edge panel, a persistent state machine, metadata-only lifecycle readers, conservative window inference, notifications, and local status export.
+Agent Watch is a local-first macOS agent monitor. The source version is 0.4.0 Preview (Build 8), with a dynamic menu bar, an edge panel, a persistent state machine, metadata-only lifecycle readers, conservative window inference, notifications, and local status export.
 
 **Doubao is out of scope for this preview; new integrations are frozen. Gemini and Devin remain experimental.** Claude Code and API Cowork have live lifecycle evidence on 4.4212.0 using Sonnet Low. Codex now confirms completion from its lifecycle journal; Stop hooks alone are not completion evidence. DSH and WorkBuddy have earlier live activity/turn-end receipts. Antigravity 2.28.2 also passed a real question-and-answer lifecycle, while its native cancellation callback was not observed. Other integrations are explicitly marked as installed, fixture-tested, inferred, blocked, or unverified in the matrix above. CLI support never implies desktop support. Hidden conversations are not guaranteed by window observation.
 
