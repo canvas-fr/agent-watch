@@ -44,10 +44,12 @@ for every record in that chain. The human prompt, parent assistant, and marker
 must each have top-level `version: "2.1.309"`; a missing or different version
 fails closed for cancellation and does not affect the normal completion-counter
 rule. A later human-origin prompt in the journal invalidates a marker for the
-older prompt, even before the metadata frame updates. On a later poll, if the
-original human frame has fallen outside the bounded tail, the exact prompt ID
-and version verification already mapped to the still-active cursor may anchor
-the match; the metadata frame must still be the same frame as the tracked run.
+older prompt, even if that marker appeared earlier in the same tail and before
+the metadata frame updates. The projector and reducer both check the final
+human prompt observed in the bounded tail. On a later poll, if the original
+human frame has fallen outside the bounded tail, the exact prompt ID and
+version verification already mapped to the still-active cursor may anchor the
+match; the metadata frame must still be the same frame as the tracked run.
 The `[Request interrupted by user for tool use]` marker and
 tool-result denials do not cancel the whole turn. Quoted or embedded marker
 text is not sufficient.
@@ -60,6 +62,15 @@ metadata. It does not query the installed CLI binary, and this evidence does
 not establish compatibility with other CLI versions. Missing versions and
 other versions, including `2.1.296`, are unverified and fail closed for
 cancellation; normal completion-counter checks remain separate.
+
+For a schema-1 cursor written before the per-record version flag existed, one
+migration fallback can use a fresh interruption marker (no older than 30
+seconds) when its exact prompt ID matches the still-active cursor and the
+direct parent assistant and marker both carry version `2.1.309`. If the human
+prompt is still visible in the tail, its version must also match. The
+transition writes the opaque replay signature and clears the legacy flag, so
+restart does not replay it. The monitor treats `cancelled` as terminal without
+a default user notification.
 
 While a run remains tracked as active, each poll may inspect its journal tail
 even when `completedTurns` and `lastAssistantUuid` have not changed. The reader
@@ -76,8 +87,9 @@ The persisted cursor is stored at
 `~/Library/Application Support/Agent Watch/metadata/claude_code_records_state.json`.
 It contains the validated session identifiers, selected counters and times,
 the matched turn ID, sequence, an opaque interruption replay signature, a
-boolean indicating whether the tracked prompt version was verified, and the
-round-robin position. Output event files use the Agent Watch private events
+boolean indicating whether the tracked prompt version was verified, a
+temporary schema-migration flag for eligible old cursors, and the round-robin
+position. Output event files use the Agent Watch private events
 directory. Directory and file reads reject symbolic links; metadata and journal
 reads are byte-bounded and rechecked with device, inode, size, and modification
 time after reading.

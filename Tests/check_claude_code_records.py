@@ -12,6 +12,7 @@ import plistlib
 import sys
 import tempfile
 import unittest
+from types import SimpleNamespace
 from unittest.mock import patch
 
 
@@ -417,6 +418,76 @@ class ClaudeCodeRecordChecks(unittest.TestCase):
         self.assertEqual(self.reader.poll_once().events_written, 0)
         self.assertFalse(any(record["state"] == "cancelled" for record in self.read_events()))
 
+    def test_later_human_prompt_invalidates_marker_seen_earlier_in_tail(self) -> None:
+        frame = self.now - timedelta(seconds=5)
+        self.write_metadata(completed=0, frame=frame, edge=frame - timedelta(seconds=1))
+        self.write_journal([self.root_user("prompt-A", frame, "human-A")])
+        self.reader.poll_once()
+
+        self.now += timedelta(seconds=1)
+        assistant_at = self.now - timedelta(milliseconds=500)
+        marker_at = self.now - timedelta(milliseconds=400)
+        later_prompt_at = self.now - timedelta(milliseconds=200)
+        self.write_metadata(completed=0, frame=frame, edge=frame - timedelta(milliseconds=185), cut_short=True)
+        self.write_journal([
+            self.root_user("prompt-A", frame, "human-A"),
+            self.root_aborted_assistant("assistant-A", "human-A", assistant_at),
+            self.root_interrupt_marker("prompt-A", "interrupt-A", "assistant-A", marker_at),
+            self.root_user("prompt-B", later_prompt_at, "human-B"),
+        ])
+
+        self.assertEqual(self.reader.poll_once().events_written, 0)
+        self.assertFalse(any(record["state"] == "cancelled" for record in self.read_events()))
+
+    def test_later_human_and_marker_do_not_reuse_earlier_turn_candidate(self) -> None:
+        frame = self.now - timedelta(seconds=5)
+        self.write_metadata(completed=0, frame=frame, edge=frame - timedelta(seconds=1))
+        self.write_journal([self.root_user("prompt-A", frame, "human-A")])
+        self.reader.poll_once()
+
+        self.now += timedelta(seconds=1)
+        assistant_a_at = self.now - timedelta(milliseconds=600)
+        marker_a_at = self.now - timedelta(milliseconds=500)
+        prompt_b_at = self.now - timedelta(milliseconds=400)
+        assistant_b_at = self.now - timedelta(milliseconds=300)
+        marker_b_at = self.now - timedelta(milliseconds=200)
+        self.write_metadata(completed=0, frame=frame, edge=frame - timedelta(milliseconds=185), cut_short=True)
+        self.write_journal([
+            self.root_user("prompt-A", frame, "human-A"),
+            self.root_aborted_assistant("assistant-A", "human-A", assistant_a_at),
+            self.root_interrupt_marker("prompt-A", "interrupt-A", "assistant-A", marker_a_at),
+            self.root_user("prompt-B", prompt_b_at, "human-B"),
+            self.root_aborted_assistant("assistant-B", "human-B", assistant_b_at),
+            self.root_interrupt_marker("prompt-B", "interrupt-B", "assistant-B", marker_b_at),
+        ])
+
+        self.assertEqual(self.reader.poll_once().events_written, 0)
+        self.assertFalse(any(record["state"] == "cancelled" for record in self.read_events()))
+
+    def test_reducer_rejects_candidate_when_final_human_prompt_differs(self) -> None:
+        frame = self.now - timedelta(seconds=5)
+        self.write_metadata(completed=0, frame=frame, edge=frame - timedelta(seconds=1))
+        self.write_journal([self.root_user("prompt-A", frame, "human-A")])
+        self.reader.poll_once()
+
+        self.now += timedelta(seconds=1)
+        marker_at = self.now - timedelta(milliseconds=100)
+        self.write_metadata(completed=0, frame=frame, edge=frame - timedelta(milliseconds=185), cut_short=True)
+        projection = ADAPTER.JournalProjection(
+            latest_prompt_id="prompt-A",
+            cancellation_prompt_id="prompt-A",
+            cancellation_timestamp=marker_at.timestamp(),
+            cancellation_signature="a" * 64,
+            current_human_prompt_id="prompt-B",
+            current_human_version_supported=True,
+            current_human_prompt_seen=True,
+        )
+        with patch.object(ADAPTER, "_journal_prompt_id", return_value=projection):
+            result = self.reader.poll_once()
+
+        self.assertEqual(result.events_written, 0)
+        self.assertFalse(any(record["state"] == "cancelled" for record in self.read_events()))
+
     def test_truncated_later_prompt_blocks_old_turn_fallback(self) -> None:
         frame = self.now - timedelta(seconds=5)
         self.write_metadata(completed=0, frame=frame, edge=frame - timedelta(seconds=1))
@@ -493,6 +564,54 @@ class ClaudeCodeRecordChecks(unittest.TestCase):
         self.assertEqual(result.events_written, 1)
         self.assertEqual(self.ordered_events()[-1]["state"], "cancelled")
         self.assertEqual(self.ordered_events()[-1]["turnID"], "prompt-tail")
+
+    def test_recent_exact_marker_migrates_legacy_active_cursor_once(self) -> None:
+        frame = self.now - timedelta(seconds=5)
+        self.write_metadata(completed=0, frame=frame, edge=frame - timedelta(seconds=1))
+        self.write_journal([self.root_user("prompt-legacy", frame, "human-legacy")])
+        self.reader.poll_once()
+
+        self.now += timedelta(seconds=1)
+        cut_short_edge = frame + timedelta(milliseconds=100)
+        self.write_metadata(completed=0, frame=frame, edge=cut_short_edge, cut_short=True)
+        self.assertEqual(self.reader.poll_once().events_written, 1)
+        self.assertEqual(self.ordered_events()[-1]["state"], "unknown")
+
+        state = json.loads(self.state.read_text(encoding="utf-8"))
+        cursor = next(iter(state["sessions"].values()))
+        self.assertTrue(cursor["active_run_seen"])
+        cursor.pop("active_interrupt_version_supported", None)
+        cursor.pop("legacy_interrupt_version_pending", None)
+        cursor.pop("last_interrupt_signature", None)
+        self.state.write_text(json.dumps(state), encoding="utf-8")
+
+        restarted = self.make_reader()
+        restored_cursor = next(iter(restarted.cursors.values()))
+        self.assertTrue(restored_cursor.legacy_interrupt_version_pending)
+
+        self.now += timedelta(seconds=1)
+        parent_at = self.now - timedelta(milliseconds=200)
+        marker_at = self.now - timedelta(milliseconds=100)
+        padding = {
+            "type": "attachment", "uuid": "legacy-padding", "sessionId": self.cli_session_id,
+            "payload": "SYNTHETIC_PADDING_DO_NOT_CAPTURE" * 12_000,
+        }
+        self.write_journal([
+            self.root_user("prompt-legacy", frame, "human-legacy"),
+            padding,
+            self.root_aborted_assistant("assistant-legacy", "human-legacy", parent_at),
+            self.root_interrupt_marker("prompt-legacy", "interrupt-legacy", "assistant-legacy", marker_at),
+        ])
+
+        result = restarted.poll_once()
+        self.assertEqual(result.events_written, 1)
+        cancellations = [record for record in self.read_events() if record["state"] == "cancelled"]
+        self.assertEqual(len(cancellations), 1)
+        self.assertFalse(next(iter(restarted.cursors.values())).legacy_interrupt_version_pending)
+
+        second_restart = self.make_reader()
+        self.assertEqual(second_restart.poll_once().events_written, 0)
+        self.assertEqual(sum(record["state"] == "cancelled" for record in self.read_events()), 1)
 
     def test_tool_use_rejection_marker_does_not_cancel_whole_turn(self) -> None:
         frame = self.now - timedelta(seconds=5)
@@ -859,6 +978,62 @@ class ClaudeCodeRecordChecks(unittest.TestCase):
             self.reader = self.make_reader()
             self.reader.poll_once()
         self.assertEqual(len(self.reader.cursors), 2)
+
+    def test_failed_postread_recheck_reports_bytes_already_consumed(self) -> None:
+        path = self.home / "changing-metadata.json"
+        payload = b"{\"metadata\":true}"
+        path.write_bytes(payload)
+        actual_fstat = ADAPTER.os.fstat
+        fstat_calls = 0
+
+        def changed_after_read(descriptor: int):
+            nonlocal fstat_calls
+            info = actual_fstat(descriptor)
+            fstat_calls += 1
+            if fstat_calls == 2:
+                return SimpleNamespace(
+                    st_mode=info.st_mode,
+                    st_dev=info.st_dev,
+                    st_ino=info.st_ino,
+                    st_size=info.st_size + 1,
+                    st_mtime_ns=info.st_mtime_ns,
+                )
+            return info
+
+        with patch.object(ADAPTER.os, "fstat", side_effect=changed_after_read):
+            opened, bytes_read = ADAPTER._read_regular(path, 1024)
+
+        self.assertIsNone(opened)
+        self.assertEqual(bytes_read, len(payload))
+
+    def test_failed_metadata_reads_consume_the_poll_global_budget(self) -> None:
+        frame = self.now - timedelta(seconds=5)
+        for index in range(9):
+            local_id = self.session_id if index == 0 else (
+                f"local_00000000-0000-4000-8000-{index + 1:012d}"
+            )
+            cli_id = f"budget-session-{index}"
+            path = self.metadata_path if index == 0 else self.add_session(local_id, cli_id)
+            self.write_metadata(
+                completed=0, frame=frame, path=path, local_id=local_id, cli_id=cli_id,
+            )
+            current_size = path.stat().st_size
+            with path.open("ab") as output:
+                output.write(b" " * (ADAPTER.MAX_METADATA_BYTES - current_size))
+
+        consumed_limits: list[int] = []
+
+        def fail_after_consumption(path: Path, maximum_bytes: int):
+            consumed = min(maximum_bytes, ADAPTER.MAX_METADATA_BYTES)
+            consumed_limits.append(consumed)
+            return None, consumed
+
+        with patch.object(ADAPTER, "_read_regular", side_effect=fail_after_consumption):
+            summary = self.reader.poll_once()
+
+        self.assertEqual(len(consumed_limits), 8)
+        self.assertEqual(sum(consumed_limits), ADAPTER.MAX_METADATA_BYTES_PER_POLL)
+        self.assertEqual(summary.diagnostic, "scan_limited")
 
 
 if __name__ == "__main__":

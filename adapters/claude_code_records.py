@@ -370,6 +370,7 @@ class Cursor:
     last_observed_at: str | None = None
     last_interrupt_signature: str | None = None
     active_interrupt_version_supported: bool = False
+    legacy_interrupt_version_pending: bool = False
 
     def to_json(self) -> dict[str, Any]:
         return asdict(self)
@@ -392,8 +393,18 @@ class Cursor:
             for name in ("last_turn_cut_short", "is_archived", "error_category_present", "active_run_seen"):
                 if not isinstance(value.get(name), bool):
                     return None
+            has_interrupt_version_status = "active_interrupt_version_supported" in value
             active_interrupt_version_supported = value.get("active_interrupt_version_supported", False)
-            if not isinstance(active_interrupt_version_supported, bool):
+            legacy_interrupt_version_pending = value.get(
+                "legacy_interrupt_version_pending",
+                not has_interrupt_version_status and value.get("active_run_seen") is True,
+            )
+            if (not isinstance(active_interrupt_version_supported, bool)
+                    or not isinstance(legacy_interrupt_version_pending, bool)):
+                return None
+            if legacy_interrupt_version_pending and (
+                not value.get("active_run_seen") or active_interrupt_version_supported
+            ):
                 return None
             if not isinstance(value.get("session_id"), str) or not LOCAL_SESSION_ID.fullmatch(value["session_id"]):
                 return None
@@ -417,7 +428,11 @@ class Cursor:
             return cls(**{
                 name: value.get(
                     name,
-                    False if name == "active_interrupt_version_supported" else None,
+                    active_interrupt_version_supported
+                    if name == "active_interrupt_version_supported"
+                    else legacy_interrupt_version_pending
+                    if name == "legacy_interrupt_version_pending"
+                    else None,
                 )
                 for name in cls.__dataclass_fields__
             })
@@ -542,37 +557,47 @@ def _plain_directory(path: Path) -> bool:
         return False
 
 
-def _read_regular(path: Path, maximum_bytes: int) -> tuple[bytes, os.stat_result] | None:
+def _read_regular(
+    path: Path,
+    maximum_bytes: int,
+) -> tuple[tuple[bytes, os.stat_result] | None, int]:
+    if maximum_bytes <= 0:
+        return None, 0
     flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0)
     try:
         descriptor = os.open(path, flags)
     except OSError:
-        return None
+        return None, 0
+    bytes_read = 0
     try:
         info = os.fstat(descriptor)
         if not stat.S_ISREG(info.st_mode) or info.st_size > maximum_bytes:
-            return None
+            return None, 0
         chunks: list[bytes] = []
-        remaining = maximum_bytes + 1
-        while remaining:
-            chunk = os.read(descriptor, min(64 * 1024, remaining))
+        while bytes_read < maximum_bytes:
+            chunk = os.read(descriptor, min(64 * 1024, maximum_bytes - bytes_read))
             if not chunk:
                 break
             chunks.append(chunk)
-            remaining -= len(chunk)
+            bytes_read += len(chunk)
         raw = b"".join(chunks)
         after = os.fstat(descriptor)
-        if (len(raw) != info.st_size or len(raw) > maximum_bytes
+        if (len(raw) != info.st_size
                 or (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns)
                 != (info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns)):
-            return None
-        return raw, after
+            return None, bytes_read
+        return (raw, after), bytes_read
+    except OSError:
+        return None, bytes_read
     finally:
-        os.close(descriptor)
+        try:
+            os.close(descriptor)
+        except OSError:
+            pass
 
 
 def _load_state(path: Path) -> tuple[dict[str, Cursor], int, str]:
-    opened = _read_regular(path, MAX_STATE_BYTES)
+    opened, _ = _read_regular(path, MAX_STATE_BYTES)
     if opened is None:
         if not path.exists():
             return {}, 0, "none"
@@ -611,22 +636,29 @@ def _hook_state_path(agent_watch_root: Path, cli_session_id: str) -> Path:
     return agent_watch_root / "metadata" / f"{key}.json"
 
 
-def _read_hook_turn(agent_watch_root: Path, cli_session_id: str) -> tuple[str | None, int]:
-    opened = _read_regular(_hook_state_path(agent_watch_root, cli_session_id), 16 * 1024)
+def _read_hook_turn(
+    agent_watch_root: Path,
+    cli_session_id: str,
+    remaining_budget: int,
+) -> tuple[str | None, int, int]:
+    opened, bytes_read = _read_regular(
+        _hook_state_path(agent_watch_root, cli_session_id),
+        min(16 * 1024, remaining_budget),
+    )
     if opened is None:
-        return None, 0
+        return None, 0, bytes_read
     raw, _ = opened
     try:
         value = json.loads(raw)
     except (UnicodeError, json.JSONDecodeError):
-        return None, 0
+        return None, 0, bytes_read
     if not isinstance(value, dict):
-        return None, 0
+        return None, 0, bytes_read
     turn_id = _identifier(value.get("turnID"))
     sequence = value.get("sequence", 0)
     if not isinstance(sequence, int) or isinstance(sequence, bool) or sequence < 0:
         sequence = 0
-    return turn_id, sequence
+    return turn_id, sequence, bytes_read
 
 
 def _journal_index(home: Path) -> tuple[dict[str, Path], str]:
@@ -853,6 +885,22 @@ def _journal_prompt_id(
               and message.get("stop_reason") == "end_turn"):
             assistant_prompt = record_prompt
             assistant_timestamp = timestamp
+
+    if cancellation_signature is not None:
+        cancellation_matches_final_human = (
+            current_human_prompt_seen
+            and current_human_prompt == cancellation_prompt
+            and current_human_version_supported
+        )
+        cancellation_matches_tracked_prompt = (
+            not current_human_prompt_seen
+            and tracked_prompt_id == cancellation_prompt
+            and tracked_version_supported
+        )
+        if not (cancellation_matches_final_human or cancellation_matches_tracked_prompt):
+            cancellation_prompt = None
+            cancellation_timestamp = None
+            cancellation_signature = None
     return JournalProjection(
         latest_prompt_id=latest_prompt,
         assistant_prompt_id=assistant_prompt,
@@ -994,16 +1042,19 @@ class ClaudeCodeRecordsReader:
             if visited >= MAX_SESSIONS_PER_POLL:
                 break
             visited += 1
-            if record.info.st_size > metadata_budget:
+            if (record.info.st_size <= MAX_METADATA_BYTES
+                    and record.info.st_size > metadata_budget):
                 summary.diagnostic = "scan_limited"
                 stop_before_current = True
                 break
-            opened = _read_regular(record.path, MAX_METADATA_BYTES)
+            opened, bytes_read = _read_regular(
+                record.path, min(MAX_METADATA_BYTES, metadata_budget)
+            )
+            metadata_budget -= bytes_read
             if opened is None:
                 summary.diagnostic = "metadata_unavailable"
                 continue
             raw, info = opened
-            metadata_budget -= len(raw)
             if (info.st_dev != record.info.st_dev or info.st_ino != record.info.st_ino
                     or info.st_size != record.info.st_size or info.st_mtime_ns != record.info.st_mtime_ns):
                 if summary.diagnostic == "none":
@@ -1024,9 +1075,10 @@ class ClaudeCodeRecordsReader:
             hook_turn_id: str | None = None
             hook_sequence = 0
             if not metadata.is_archived:
-                hook_turn_id, hook_sequence = _read_hook_turn(
-                    self.agent_watch_root, metadata.cli_session_id
+                hook_turn_id, hook_sequence, hook_bytes_read = _read_hook_turn(
+                    self.agent_watch_root, metadata.cli_session_id, metadata_budget
                 )
+                metadata_budget -= hook_bytes_read
 
             journal_projection = JournalProjection()
             mapping_unresolved = (
@@ -1080,7 +1132,8 @@ class ClaudeCodeRecordsReader:
                         journal_budget,
                         tracked_prompt_id=prior.turn_id if cancellation_probe_due else None,
                         tracked_version_supported=(
-                            prior.active_interrupt_version_supported
+                            (prior.active_interrupt_version_supported
+                             or prior.legacy_interrupt_version_pending)
                             if cancellation_probe_due and prior is not None else False
                         ),
                     )
@@ -1242,12 +1295,17 @@ def _reduce_snapshot(
         last_observed_at: str | None,
         last_interrupt_signature: str | None = None,
         active_interrupt_version_supported: bool | None = None,
+        legacy_interrupt_version_pending: bool | None = None,
     ) -> Cursor:
         if last_interrupt_signature is None and prior is not None:
             last_interrupt_signature = prior.last_interrupt_signature
         if active_interrupt_version_supported is None:
             active_interrupt_version_supported = (
                 prior.active_interrupt_version_supported if prior is not None else False
+            )
+        if legacy_interrupt_version_pending is None:
+            legacy_interrupt_version_pending = (
+                prior.legacy_interrupt_version_pending if prior is not None else False
             )
         return Cursor(
             device=info.st_dev,
@@ -1272,6 +1330,7 @@ def _reduce_snapshot(
             last_observed_at=last_observed_at,
             last_interrupt_signature=last_interrupt_signature,
             active_interrupt_version_supported=active_interrupt_version_supported,
+            legacy_interrupt_version_pending=legacy_interrupt_version_pending,
         )
 
     def plan(state: str, evidence: str, source_field: str, signature: str,
@@ -1340,6 +1399,7 @@ def _reduce_snapshot(
             last_observed_at=None,
             last_interrupt_signature=bootstrap_interrupt_signature,
             active_interrupt_version_supported=active_interrupt_version_supported,
+            legacy_interrupt_version_pending=False,
         )
 
     regressed = metadata.completed_turns < prior.completed_turns
@@ -1351,6 +1411,7 @@ def _reduce_snapshot(
             turn_id=None, active_frame_at=None, active_run_seen=False,
             sequence=prior.sequence, last_observed_at=prior.last_observed_at,
             active_interrupt_version_supported=False,
+            legacy_interrupt_version_pending=False,
         )
 
     if metadata.is_archived:
@@ -1358,6 +1419,7 @@ def _reduce_snapshot(
             turn_id=None, active_frame_at=None, active_run_seen=False,
             sequence=prior.sequence, last_observed_at=prior.last_observed_at,
             active_interrupt_version_supported=False,
+            legacy_interrupt_version_pending=False,
         )
 
     edge_advanced = current_edge is not None and (
@@ -1414,6 +1476,15 @@ def _reduce_snapshot(
         and prior.active_frame_at == current_frame
         and prior.turn_id is not None
         and journal_cancel_prompt_id is not None
+        and (
+            (journal_human_prompt_seen
+             and journal_human_prompt_id == journal_cancel_prompt_id
+             and journal_human_version_supported)
+            or (not journal_human_prompt_seen
+                and journal_cancel_prompt_id == prior.turn_id
+                and (prior.active_interrupt_version_supported
+                     or prior.legacy_interrupt_version_pending))
+        )
         and (journal_cancel_prompt_id == journal_prompt_id
              or (journal_prompt_id is None and journal_cancel_prompt_id == prior.turn_id))
         and journal_cancel_timestamp is not None
@@ -1452,6 +1523,7 @@ def _reduce_snapshot(
     active_turn = prior.turn_id if prior_active else turn_id
     active = prior_active
     active_interrupt_version_supported = prior.active_interrupt_version_supported
+    legacy_interrupt_version_pending = prior.legacy_interrupt_version_pending
     if frame_advanced:
         active = frame_fresh and turn_id is not None
         active_frame = current_frame if active else None
@@ -1462,21 +1534,27 @@ def _reduce_snapshot(
             and journal_human_prompt_id == turn_id
             and journal_human_version_supported
         )
+        legacy_interrupt_version_pending = False
     elif prior_active and journal_human_prompt_seen:
         active_interrupt_version_supported = (
             journal_human_prompt_id == prior.turn_id
             and journal_human_version_supported
         )
+        legacy_interrupt_version_pending = False
+    elif not prior_active:
+        legacy_interrupt_version_pending = False
     for event in plans:
         if event.state in {"failed", "responseEnded", "cancelled"} and event.turn_id == active_turn:
             active = False
             active_frame = None
             active_interrupt_version_supported = False
+            legacy_interrupt_version_pending = False
         elif (event.state == "unknown" and event.turn_id == active_turn
               and not event.source.endswith("lastTurnCutShort_unclassified")):
             active = False
             active_frame = None
             active_interrupt_version_supported = False
+            legacy_interrupt_version_pending = False
     if not active and active_turn is None:
         active_turn = turn_id
     return plans, make_cursor(
@@ -1490,6 +1568,7 @@ def _reduce_snapshot(
             if cancellation_evidence_is_current else None
         ),
         active_interrupt_version_supported=active_interrupt_version_supported,
+        legacy_interrupt_version_pending=legacy_interrupt_version_pending,
     )
 
 
