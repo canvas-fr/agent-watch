@@ -32,6 +32,8 @@ final class MonitorModel: NSObject, ObservableObject, UNUserNotificationCenterDe
     private let geminiCollector = GeminiCollector()
     private let floatingPanel = FloatingPanelController()
     private var demoTurn = UUID().uuidString
+    private var engineCache = SnapshotFileCache()
+    private var completionCache = SnapshotFileCache()
 
     override init() {
         supportDirectory = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Library/Application Support/Agent Watch")
@@ -44,19 +46,19 @@ final class MonitorModel: NSObject, ObservableObject, UNUserNotificationCenterDe
             completions.remove(appID: "demo")
         }
         let enginePath = supportDirectory.appendingPathComponent("engine.json")
-        if let size = try? enginePath.resourceValues(forKeys: [.fileSizeKey]).fileSize, size < 8_000_000,
+        if let size = try? enginePath.resourceValues(forKeys: [.fileSizeKey]).fileSize, size < 64 * 1024 * 1024,
            let data = try? Data(contentsOf: enginePath), let saved = try? JSONDecoder().decode(SessionStore.self, from: data) {
             store = saved
             store.remove(appID: "demo")
-            let invalidated = store.invalidatePrematureStopCompletions()
+            let invalidated = store.invalidateUnconfirmedCompletions()
             if !invalidated.isEmpty {
                 for receipt in invalidated {
                     completions.remove(appID: receipt.appID, sessionID: receipt.sessionID, turnID: receipt.turnID)
                 }
             }
-            store.removeInferred()
+            store.removeWindowObservations()
             store.expire(now: Date())
-            sessions = store.sessions.filter { !($0.evidence == .inferred && $0.stale) }
+            sessions = store.sessions.filter { !($0.isWindowObservation && $0.stale) }
         }
         UNUserNotificationCenter.current().delegate = self
         demo = CommandLine.arguments.contains("--demo")
@@ -64,6 +66,7 @@ final class MonitorModel: NSObject, ObservableObject, UNUserNotificationCenterDe
         Task {
             let settings = await UNUserNotificationCenter.current().notificationSettings()
             notificationsEnabled = settings.authorizationStatus == .authorized
+            diagnostics["notifications"] = Self.notificationStatus(settings.authorizationStatus)
         }
         task = Task { [weak self] in
             while !Task.isCancelled {
@@ -182,7 +185,7 @@ final class MonitorModel: NSObject, ObservableObject, UNUserNotificationCenterDe
         }
         store.expire(now: now)
         let before = Dictionary(uniqueKeysWithValues: sessions.map { ($0.id, $0) })
-        sessions = store.sessions.filter { !($0.evidence == .inferred && $0.stale) }
+        sessions = store.sessions.filter { !($0.isWindowObservation && $0.stale) }
         demo = sessions.contains { $0.appID == "demo" }
         for session in sessions {
             if stateSince[session.id] == nil || before[session.id]?.state != session.state || before[session.id]?.turnID != session.turnID {
@@ -210,8 +213,12 @@ final class MonitorModel: NSObject, ObservableObject, UNUserNotificationCenterDe
         Task {
             do {
                 notificationsEnabled = try await UNUserNotificationCenter.current().requestAuthorization(options: [.alert, .sound])
+                diagnostics["notifications"] = notificationsEnabled ? "authorized" : "not_authorized"
                 statusMessage = notificationsEnabled ? "系统通知已开启" : "通知未授权；仍可查看菜单栏和面板提醒"
-            } catch { statusMessage = "系统通知暂不可用；面板提醒仍可使用" }
+            } catch {
+                diagnostics["notifications"] = "authorization_request_failed_code_\((error as NSError).code)"
+                statusMessage = "系统通知暂不可用；面板提醒仍可使用"
+            }
         }
     }
 
@@ -260,13 +267,41 @@ final class MonitorModel: NSObject, ObservableObject, UNUserNotificationCenterDe
         let message = appName(notice.appID) + " · " + notice.state.label + (notice.evidence == .inferred ? "（推断）" : "")
         recentNotices.insert(message, at: 0)
         recentNotices = Array(recentNotices.prefix(20))
-        guard notificationsEnabled else { return }
-        let content = UNMutableNotificationContent()
-        content.title = "Agent Watch"
-        content.body = message
-        content.sound = .default
-        content.userInfo = ["appID": notice.appID]
-        UNUserNotificationCenter.current().add(UNNotificationRequest(identifier: UUID().uuidString, content: content, trigger: nil))
+        Task { [weak self] in
+            guard let self else { return }
+            let center = UNUserNotificationCenter.current()
+            let settings = await center.notificationSettings()
+            self.notificationsEnabled = settings.authorizationStatus == .authorized
+            self.diagnostics["notifications"] = Self.notificationStatus(settings.authorizationStatus)
+            guard self.notificationsEnabled else {
+                self.diagnostics["notification_last_request"] = "not_requested_without_authorization"
+                _ = self.persistSnapshot()
+                return
+            }
+            let content = UNMutableNotificationContent()
+            content.title = "Agent Watch"
+            content.body = message
+            content.sound = .default
+            content.userInfo = ["appID": notice.appID]
+            let request = UNNotificationRequest(identifier: UUID().uuidString, content: content, trigger: nil)
+            center.add(request) { [weak self] error in
+                let outcome = error.map { "failed_code_\(($0 as NSError).code)" } ?? "accepted_by_system"
+                Task { @MainActor [weak self] in
+                    guard let self else { return }
+                    self.diagnostics["notification_last_request"] = outcome
+                    _ = self.persistSnapshot()
+                }
+            }
+        }
+    }
+
+    private static func notificationStatus(_ status: UNAuthorizationStatus) -> String {
+        switch status {
+        case .authorized: return "authorized"
+        case .denied: return "denied"
+        case .notDetermined: return "not_determined"
+        default: return "limited_or_unknown"
+        }
     }
 
     nonisolated func userNotificationCenter(_ center: UNUserNotificationCenter, didReceive response: UNNotificationResponse) async {
@@ -280,6 +315,11 @@ final class MonitorModel: NSObject, ObservableObject, UNUserNotificationCenterDe
         let demoIncluded: Bool
         let statusBar: String
         let unreadCompletions: Int
+        let accessibilityTrusted: Bool
+        let notificationsEnabled: Bool
+        let paused: Bool
+        let windowObservation: Bool
+        let notifyWindowCompletions: Bool
         let sessions: [SessionSnapshot]
         let diagnostics: [String: String]
     }
@@ -290,6 +330,9 @@ final class MonitorModel: NSObject, ObservableObject, UNUserNotificationCenterDe
         encoder.dateEncodingStrategy = .iso8601
         return try encoder.encode(Export(version: "0.3.2-preview", collectedAt: Date(), demoIncluded: demo,
                                          statusBar: barText, unreadCompletions: completionCount,
+                                         accessibilityTrusted: AXIsProcessTrusted(), notificationsEnabled: notificationsEnabled,
+                                         paused: paused, windowObservation: windowObservation,
+                                         notifyWindowCompletions: notifyWindowCompletions,
                                          sessions: sessions, diagnostics: diagnostics))
     }
 
@@ -298,13 +341,16 @@ final class MonitorModel: NSObject, ObservableObject, UNUserNotificationCenterDe
         let engine = supportDirectory.appendingPathComponent("engine.json")
         let completionPath = supportDirectory.appendingPathComponent("completions.json")
         do {
-            try JSONEncoder().encode(completions).write(to: completionPath, options: .atomic)
-            try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: completionPath.path)
-            try JSONEncoder().encode(store).write(to: engine, options: .atomic)
-            try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: engine.path)
+            let encoder = JSONEncoder()
+            encoder.outputFormatting = [.sortedKeys]
+            try completionCache.write(encoder.encode(completions), to: completionPath)
+            var persistent = store
+            persistent.remove(appID: "demo")
+            try engineCache.write(encoder.encode(persistent.persistentCopy()), to: engine)
             try snapshotData().write(to: path, options: .atomic)
             try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: path.path)
             return true
         } catch { statusMessage = "本地状态保存失败；待处理事件已保留"; return false }
     }
+
 }

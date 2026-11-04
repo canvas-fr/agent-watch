@@ -53,7 +53,7 @@ final class ClaudeCancellationBridge {
                 events.append(MonitorEvent(id: UUID().uuidString, appID: "claude",
                     sessionID: current.sessionID, turnID: current.turnID,
                     state: .cancelled, evidence: .inferred, observedAt: now,
-                    sequence: sequence, source: "ax:claude:cowork_interrupted"))
+                    sequence: sequence, source: "ax:claude:cowork_interrupted", identityScope: .session))
                 witnesses.removeValue(forKey: key)
             } else {
                 witnesses.removeValue(forKey: key)

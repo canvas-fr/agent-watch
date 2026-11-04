@@ -15,6 +15,19 @@ public enum EvidenceKind: String, Codable, Sendable {
     case inferred
 }
 
+/// Identity lifetime is independent of confidence. A journal observation can
+/// be inferred and still belong to a durable session.
+public enum IdentityScope: String, Codable, Sendable {
+    case session
+    case window
+}
+
+private func legacyIdentityScope(appID: String, source: String) -> IdentityScope {
+    if appID == "claude" && source == "ax:claude:cowork_interrupted" { return .session }
+    let windowSource = source == "ax" || source.hasPrefix("ax:") || source.hasPrefix("ax_window_")
+    return windowSource ? .window : .session
+}
+
 public struct MonitorEvent: Codable, Sendable {
     public let id: String
     public let appID: String
@@ -26,6 +39,7 @@ public struct MonitorEvent: Codable, Sendable {
     public let sequence: Int?
     public let parentSessionID: String?
     public let source: String
+    public let identityScope: IdentityScope?
 
     public init(
         id: String,
@@ -37,7 +51,8 @@ public struct MonitorEvent: Codable, Sendable {
         observedAt: Date,
         sequence: Int? = nil,
         parentSessionID: String? = nil,
-        source: String
+        source: String,
+        identityScope: IdentityScope? = nil
     ) {
         self.id = id
         self.appID = appID
@@ -49,6 +64,7 @@ public struct MonitorEvent: Codable, Sendable {
         self.sequence = sequence
         self.parentSessionID = parentSessionID
         self.source = source
+        self.identityScope = identityScope
     }
 }
 
@@ -63,6 +79,11 @@ public struct SessionSnapshot: Codable, Identifiable, Sendable {
     public let source: String
     public let parentSessionID: String?
     public let stale: Bool
+    public let identityScope: IdentityScope?
+
+    public var isWindowObservation: Bool {
+        (identityScope ?? legacyIdentityScope(appID: appID, source: source)) == .window
+    }
 
     public init(
         appID: String,
@@ -73,7 +94,8 @@ public struct SessionSnapshot: Codable, Identifiable, Sendable {
         updatedAt: Date,
         source: String,
         parentSessionID: String?,
-        stale: Bool
+        stale: Bool,
+        identityScope: IdentityScope? = nil
     ) {
         self.id = Self.makeID(appID: appID, sessionID: sessionID)
         self.appID = appID
@@ -85,6 +107,7 @@ public struct SessionSnapshot: Codable, Identifiable, Sendable {
         self.source = source
         self.parentSessionID = parentSessionID
         self.stale = stale
+        self.identityScope = identityScope
     }
 
     private static func makeID(appID: String, sessionID: String) -> String {
@@ -152,9 +175,9 @@ private struct SessionRecord: Codable, Sendable {
         lastObservedState = try values.decode(SessionState.self, forKey: .lastObservedState)
         terminalState = try values.decodeIfPresent(SessionState.self, forKey: .terminalState)
         eventIDs = try values.decode([String].self, forKey: .eventIDs)
-        eventIDSet = try values.decode(Set<String>.self, forKey: .eventIDSet)
+        eventIDSet = try values.decodeIfPresent(Set<String>.self, forKey: .eventIDSet) ?? Set(eventIDs)
         closedTurnIDs = try values.decode([String].self, forKey: .closedTurnIDs)
-        closedTurnIDSet = try values.decode(Set<String>.self, forKey: .closedTurnIDSet)
+        closedTurnIDSet = try values.decodeIfPresent(Set<String>.self, forKey: .closedTurnIDSet) ?? Set(closedTurnIDs)
         notifiedTerminalStates = try values.decode(Set<SessionState>.self, forKey: .notifiedTerminalStates)
         lastSequencesByDomain = try values.decodeIfPresent([String: Int].self, forKey: .lastSequencesByDomain) ?? [:]
         if lastSequencesByDomain.isEmpty,
@@ -170,10 +193,10 @@ private struct SessionRecord: Codable, Sendable {
         try values.encode(lastObservedState, forKey: .lastObservedState)
         try values.encodeIfPresent(terminalState, forKey: .terminalState)
         try values.encode(eventIDs, forKey: .eventIDs)
-        try values.encode(eventIDSet, forKey: .eventIDSet)
+        try values.encode(eventIDSet.sorted(), forKey: .eventIDSet)
         try values.encode(closedTurnIDs, forKey: .closedTurnIDs)
-        try values.encode(closedTurnIDSet, forKey: .closedTurnIDSet)
-        try values.encode(notifiedTerminalStates, forKey: .notifiedTerminalStates)
+        try values.encode(closedTurnIDSet.sorted(), forKey: .closedTurnIDSet)
+        try values.encode(notifiedTerminalStates.sorted { $0.rawValue < $1.rawValue }, forKey: .notifiedTerminalStates)
         try values.encode(lastSequencesByDomain, forKey: .lastSequencesByDomain)
         try values.encode(lastTouched, forKey: .lastTouched)
     }
@@ -218,6 +241,22 @@ public struct SessionStore: Codable, Sendable {
     private var records: [SessionKey: SessionRecord] = [:]
     private var touchCounter: UInt64 = 0
 
+    private enum CodingKeys: String, CodingKey { case records, touchCounter }
+
+    public func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        var entries = container.nestedUnkeyedContainer(forKey: .records)
+        // Preserve the legacy dictionary-pair wire format while making a
+        // stable byte representation for unchanged-state write suppression.
+        for key in records.keys.sorted(by: {
+            $0.appID == $1.appID ? $0.sessionID < $1.sessionID : $0.appID < $1.appID
+        }) {
+            try entries.encode(key)
+            try entries.encode(records[key]!)
+        }
+        try container.encode(touchCounter, forKey: .touchCounter)
+    }
+
     public init() {}
 
     public mutating func remove(appID: String) {
@@ -228,15 +267,30 @@ public struct SessionStore: Codable, Sendable {
         records = records.filter { $0.value.snapshot.evidence != .inferred }
     }
 
-    /// Reclassifies persisted terminal states produced by legacy Stop hooks.
-    /// Those hooks recorded stop intent, not a completed turn. Event IDs and
+    public mutating func removeWindowObservations() {
+        records = records.filter { !$0.value.snapshot.isWindowObservation }
+    }
+
+    /// Ephemeral windows are rediscovered after launch. Durable inferred
+    /// sessions, replay guards and pending turns must survive a restart.
+    public func persistentCopy() -> SessionStore {
+        var copy = self
+        copy.removeWindowObservations()
+        copy.touchCounter = copy.records.values.map(\.lastTouched).max() ?? 0
+        return copy
+    }
+
+    /// Reclassifies persisted terminal states produced by legacy early hooks.
+    /// Those callbacks recorded stop intent, not a completed turn. Event IDs and
     /// closed-turn history remain intact so replay cannot restore the false end.
-    public mutating func invalidatePrematureStopCompletions() -> [(appID: String, sessionID: String, turnID: String)] {
+    public mutating func invalidateUnconfirmedCompletions() -> [(appID: String, sessionID: String, turnID: String)] {
         let stopSources: Set<String> = [
             "codex:Stop",
             "codex:SubagentStop",
             "claude_code:Stop",
             "claude_code:SubagentStop",
+            "devin_local:Stop",
+            "devin:post_cascade_response",
         ]
         let orderedKeys = records.keys.sorted {
             if $0.appID != $1.appID { return $0.appID < $1.appID }
@@ -265,13 +319,18 @@ public struct SessionStore: Codable, Sendable {
                 updatedAt: previous.updatedAt,
                 source: previous.source + ":awaiting_confirmation",
                 parentSessionID: previous.parentSessionID,
-                stale: previous.stale
+                stale: previous.stale,
+                identityScope: previous.identityScope
             )
             record.lastTouched = nextTouch()
             records[key] = record
         }
 
         return invalidated
+    }
+
+    public mutating func invalidatePrematureStopCompletions() -> [(appID: String, sessionID: String, turnID: String)] {
+        invalidateUnconfirmedCompletions()
     }
 
     public var sessions: [SessionSnapshot] {
@@ -337,7 +396,8 @@ public struct SessionStore: Codable, Sendable {
                 record.terminalState = event.state
             }
             record.snapshot = Self.snapshot(for: event, stale: false,
-                                            previousParentID: record.snapshot.parentSessionID)
+                                            previousParentID: record.snapshot.parentSessionID,
+                                            previousIdentityScope: record.snapshot.identityScope)
             record.lastTouched = nextTouch()
             records[key] = record
 
@@ -400,14 +460,16 @@ public struct SessionStore: Codable, Sendable {
                     updatedAt: previous.updatedAt,
                     source: previous.source,
                     parentSessionID: previous.parentSessionID,
-                    stale: true
+                    stale: true,
+                    identityScope: previous.identityScope
                 )
                 records[key] = record
             }
         }
     }
 
-    private static func snapshot(for event: MonitorEvent, stale: Bool, previousParentID: String? = nil) -> SessionSnapshot {
+    private static func snapshot(for event: MonitorEvent, stale: Bool, previousParentID: String? = nil,
+                                 previousIdentityScope: IdentityScope? = nil) -> SessionSnapshot {
         SessionSnapshot(
             appID: event.appID,
             sessionID: event.sessionID,
@@ -417,7 +479,9 @@ public struct SessionStore: Codable, Sendable {
             updatedAt: event.observedAt,
             source: event.source,
             parentSessionID: event.parentSessionID ?? previousParentID,
-            stale: stale
+            stale: stale,
+            identityScope: event.identityScope ?? previousIdentityScope
+                ?? legacyIdentityScope(appID: event.appID, source: event.source)
         )
     }
 

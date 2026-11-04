@@ -1,6 +1,6 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "title": "Agent Watch MonitorEvent 0.2",
+  "title": "Agent Watch MonitorEvent 0.3",
   "type": "object",
   "additionalProperties": false,
   "required": [
@@ -85,6 +85,14 @@
         "null"
       ],
       "maxLength": 256
+    },
+    "identityScope": {
+      "enum": [
+        "session",
+        "window",
+        null
+      ],
+      "description": "Identity lifetime, independent of explicit/inferred evidence; window observations are rediscovered after restart."
     }
   }
 }

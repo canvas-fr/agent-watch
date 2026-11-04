@@ -64,6 +64,11 @@ struct InboxChecks {
             evidence: .explicit, observedAt: now, source: "claude_code:Stop")
         try expect(normalizeLifecycleEvidence(claudeStop).state == .unknown,
                    "Claude Stop can also be blocked by a later hook")
+        let legacyPost = MonitorEvent(id: "devin-early-post", appID: "devin", sessionID: "devin-session",
+            turnID: "devin-turn", state: .responseEnded, evidence: .explicit, observedAt: now,
+            source: "devin:post_cascade_response")
+        try expect(normalizeLifecycleEvidence(legacyPost).state == .unknown,
+                   "an old installed Devin bridge cannot reintroduce early completion")
     }
 
     private static func badFilesDoNotStarveLaterEvents() async throws {

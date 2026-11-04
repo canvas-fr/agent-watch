@@ -14,8 +14,159 @@ struct CoreChecks {
         try checksPersistenceRoundTrip()
         try checksExpiryAndChildren()
         try checksParentMetadataAcrossSources()
+        try checksDurableInferredSessionsSurviveRestart()
+        try checksWindowHeartbeatsDoNotChangeDurableSnapshot()
+        try checksLegacyDevinEndIsReclassified()
+        try checksSnapshotCacheDetectsReplacement()
+        try checksTerminalEncodingIsStable()
         try checksCapacity()
         print("PASS: Agent Watch core state, ordering, notice, expiry, and capacity checks")
+    }
+
+    private static func checksSnapshotCacheDetectsReplacement() throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent("agent-watch-cache-" + UUID().uuidString)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let file = directory.appendingPathComponent("engine.json")
+        var cache = SnapshotFileCache()
+        let expected = Data("expected-state".utf8)
+        let first = try cache.write(expected, to: file)
+        let initial = try FileManager.default.attributesOfItem(atPath: file.path)
+        let repeated = try cache.write(expected, to: file)
+        try expect(first && !repeated, "unchanged persisted bytes must not be rewritten")
+        try Data("outdated-state".utf8).write(to: file, options: .atomic)
+        if let originalDate = initial[.modificationDate] {
+            try FileManager.default.setAttributes([.modificationDate: originalDate], ofItemAtPath: file.path)
+        }
+        let repaired = try cache.write(expected, to: file)
+        let actual = try Data(contentsOf: file)
+        try expect(repaired && actual == expected, "an old writer's atomic replacement must invalidate the cache")
+        let link = directory.appendingPathComponent("link.json")
+        try FileManager.default.createSymbolicLink(atPath: link.path, withDestinationPath: file.path)
+        var rejectedLink = false
+        do { try cache.write(Data("wrong-state".utf8), to: link) } catch { rejectedLink = true }
+        try expect(rejectedLink, "a symlink is not an owned snapshot file")
+        let unchanged = try Data(contentsOf: file)
+        try expect(unchanged == expected, "a rejected cache target cannot modify another file")
+    }
+
+    private static func checksTerminalEncodingIsStable() throws {
+        let start = Date(timeIntervalSince1970: 96_000)
+        var store = SessionStore()
+        for (offset, state) in [SessionState.running, .responseEnded, .failed].enumerated() {
+            let time = start.addingTimeInterval(Double(offset))
+            _ = store.apply(MonitorEvent(id: "terminal-\(offset)", appID: "codex", sessionID: "stable-session",
+                turnID: "stable-turn", state: state, evidence: .explicit, observedAt: time,
+                source: "fixture"), now: time)
+        }
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.sortedKeys]
+        let before = try encoder.encode(store.persistentCopy())
+        let restored = try JSONDecoder().decode(SessionStore.self, from: before)
+        let after = try encoder.encode(restored.persistentCopy())
+        try expect(before == after, "nonempty terminal notice sets have stable persisted order")
+        let object = try JSONSerialization.jsonObject(with: before) as? [String: Any]
+        let pairs = object?["records"] as? [Any]
+        let record = pairs?.dropFirst().first as? [String: Any]
+        try expect(record?["eventIDSet"] != nil && record?["closedTurnIDSet"] != nil,
+                   "older decoders still receive their required replay-set fields")
+    }
+
+    private static func checksDurableInferredSessionsSurviveRestart() throws {
+        let start = Date(timeIntervalSince1970: 80_000)
+        var store = SessionStore()
+        let running = MonitorEvent(id: "durable-running", appID: "claude_code",
+            sessionID: "cli-session", turnID: "real-turn", state: .running,
+            evidence: .inferred, observedAt: start, source: "claude_code_records:latestUserFrameAt")
+        _ = store.apply(running, now: start)
+        _ = store.apply(MonitorEvent(id: "window-running", appID: "gemini",
+            sessionID: "ephemeral-window", turnID: "observed-turn", state: .running,
+            evidence: .inferred, observedAt: start, source: "ax:gemini:stop_button_visible"), now: start)
+        let encoder = JSONEncoder()
+        var restored = try JSONDecoder().decode(SessionStore.self, from: encoder.encode(store.persistentCopy()))
+        restored.removeWindowObservations()
+        try expect(restored.sessions.count == 1 && restored.sessions.first?.sessionID == "cli-session",
+                   "confidence must not erase a durable inferred session on restart")
+        let notice = restored.apply(MonitorEvent(id: "durable-ended", appID: "claude_code",
+            sessionID: "cli-session", turnID: "real-turn", state: .responseEnded,
+            evidence: .explicit, observedAt: start.addingTimeInterval(1),
+            source: "claude_code_records:completedTurns"), now: start.addingTimeInterval(1))
+        try expect(notice?.state == .responseEnded, "a resumed tracked turn must still notify its actual end")
+        _ = restored.apply(MonitorEvent(id: "linked-cancel", appID: "claude", sessionID: "audit-session",
+            turnID: "audit-turn", state: .cancelled, evidence: .inferred,
+            observedAt: start, source: "ax:claude:cowork_interrupted", identityScope: .session), now: start)
+        restored.removeWindowObservations()
+        try expect(restored.sessions.contains { $0.sessionID == "audit-session" },
+                   "a linked native event may carry durable session identity")
+
+        // Old files contain no identityScope and include the old dictionary
+        // pair encoding. Confidence alone must not decide their identity.
+        func legacy(_ value: Any) -> Any {
+            if var object = value as? [String: Any] {
+                object.removeValue(forKey: "identityScope")
+                return object.mapValues(legacy)
+            }
+            if let array = value as? [Any] { return array.map(legacy) }
+            return value
+        }
+        let oldObject = legacy(try JSONSerialization.jsonObject(with: encoder.encode(store)))
+        var old = try JSONDecoder().decode(SessionStore.self, from: JSONSerialization.data(withJSONObject: oldObject))
+        old.removeWindowObservations()
+        try expect(old.sessions.count == 1 && old.sessions.first?.sessionID == "cli-session",
+                   "legacy canonical metadata survives while legacy AX windows are discarded")
+        _ = old.apply(MonitorEvent(id: "typed-window", appID: "gemini", sessionID: "custom-window",
+            turnID: "window-turn", state: .running, evidence: .explicit, observedAt: start,
+            source: "custom_window_adapter", identityScope: .window), now: start)
+        _ = old.apply(MonitorEvent(id: "typed-heartbeat", appID: "gemini", sessionID: "custom-window",
+            turnID: "window-turn", state: .running, evidence: .inferred, observedAt: start.addingTimeInterval(1),
+            source: "another_observer"), now: start.addingTimeInterval(1))
+        try expect(old.sessions.first(where: { $0.sessionID == "custom-window" })?.isWindowObservation == true,
+                   "an observer without identity metadata cannot erase a previously declared window scope")
+        _ = old.apply(MonitorEvent(id: "other-source", appID: "claude", sessionID: "other-session",
+            turnID: "other-turn", state: .running, evidence: .inferred, observedAt: start,
+            source: "axolotl_adapter"), now: start)
+        try expect(old.persistentCopy().sessions.contains { $0.sessionID == "other-session" },
+                   "an unrelated adapter name beginning with ax is not a window namespace")
+    }
+
+    private static func checksWindowHeartbeatsDoNotChangeDurableSnapshot() throws {
+        let start = Date(timeIntervalSince1970: 90_000)
+        var store = SessionStore()
+        _ = store.apply(MonitorEvent(id: "saved-prompt", appID: "claude", sessionID: "saved-session",
+            turnID: "saved-turn", state: .waitingInput, evidence: .inferred, observedAt: start,
+            source: "claude_desktop_cowork:audit_v1"), now: start)
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.sortedKeys]
+        let baseline = try encoder.encode(store.persistentCopy())
+        for index in 0..<150 {
+            let timestamp = start.addingTimeInterval(Double(index))
+            _ = store.apply(MonitorEvent(id: "heartbeat-\(index)", appID: "gemini",
+                sessionID: "window", turnID: "window-turn", state: .unknown, evidence: .inferred,
+                observedAt: timestamp, source: "ax:gemini:no_verified_lifecycle_evidence",
+                identityScope: .window), now: timestamp)
+        }
+        let afterHeartbeats = try encoder.encode(store.persistentCopy())
+        try expect(afterHeartbeats == baseline,
+                   "window-only heartbeat traffic must not rewrite identical durable engine state")
+        var restored = try JSONDecoder().decode(SessionStore.self, from: baseline)
+        let duplicate = MonitorEvent(id: "saved-prompt", appID: "claude", sessionID: "saved-session",
+            turnID: "saved-turn", state: .waitingInput, evidence: .inferred, observedAt: start,
+            source: "claude_desktop_cowork:audit_v1")
+        try expect(restored.apply(duplicate, now: start) == nil, "persisted replay guards remain effective")
+    }
+
+    private static func checksLegacyDevinEndIsReclassified() throws {
+        var store = SessionStore()
+        let time = Date(timeIntervalSince1970: 95_000)
+        _ = store.apply(MonitorEvent(id: "legacy-devin-post", appID: "devin", sessionID: "legacy-session",
+            turnID: "legacy-turn", state: .responseEnded, evidence: .explicit, observedAt: time,
+            source: "devin:post_cascade_response"), now: time)
+        let changed = store.invalidateUnconfirmedCompletions()
+        try expect(changed.count == 1 && changed.first?.appID == "devin",
+                   "a legacy Devin post is an unconfirmed end, not a durable result")
+        try expect(store.sessions.first?.state == .unknown,
+                   "persisted early post callbacks cannot continue showing completion")
+        try expect(store.invalidateUnconfirmedCompletions().isEmpty, "the migration is idempotent")
     }
 
     private static func checksColdResponseEndIsSilent() throws {

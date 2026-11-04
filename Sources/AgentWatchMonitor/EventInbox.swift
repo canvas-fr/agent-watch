@@ -162,12 +162,14 @@ actor MonitorCollector {
 /// Legacy Stop observers report intent before the host has decided whether to
 /// continue. Durable lifecycle records are the confirmation source.
 func normalizeLifecycleEvidence(_ event: MonitorEvent) -> MonitorEvent {
-    guard event.state == .responseEnded,
-          ["codex", "claude_code"].contains(event.appID),
-          [event.appID + ":Stop", event.appID + ":SubagentStop"].contains(event.source) else { return event }
+    let stopIntent = ["codex", "claude_code"].contains(event.appID)
+        && [event.appID + ":Stop", event.appID + ":SubagentStop"].contains(event.source)
+    let devinIntent = event.appID == "devin"
+        && ["devin_local:Stop", "devin:post_cascade_response"].contains(event.source)
+    guard event.state == .responseEnded && (stopIntent || devinIntent) else { return event }
     return MonitorEvent(id: event.id, appID: event.appID, sessionID: event.sessionID,
                         turnID: event.turnID, state: .unknown, evidence: event.evidence,
                         observedAt: event.observedAt, sequence: event.sequence,
                         parentSessionID: event.parentSessionID,
-                        source: event.source + ":awaiting_confirmation")
+                        source: event.source + ":awaiting_confirmation", identityScope: event.identityScope)
 }
