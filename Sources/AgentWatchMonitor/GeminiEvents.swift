@@ -47,7 +47,13 @@ final class GeminiEventReducer {
                                 reason: observation.reason))
             windows[window] = cursor
         }
-        for key in Array(windows.keys) where !seen.contains(key) {
+        // A failed AXWindows read does not prove that a physical window closed.
+        // The adapter emits an unknown heartbeat when it has a cached identity;
+        // this set also protects cursors that could not produce that heartbeat.
+        // Run evidence is cleared at the adapter, so recovery must observe Stop
+        // again before it can infer a response end.
+        for key in Array(windows.keys)
+        where !seen.contains(key) && !scan.preservedWindowIdentities.contains(key) {
             if var prior = windows.removeValue(forKey: key) {
                 events.append(event(.unknown, cursor: &prior, at: Date(), reason: "window_unobservable"))
             }

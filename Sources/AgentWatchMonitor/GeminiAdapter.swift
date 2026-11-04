@@ -33,6 +33,10 @@ public struct GeminiSnapshotDiagnostic: Codable, Sendable {
     public let axErrorCode: Int32?
     public let elementsVisited: Int
     public let roleCounts: [String: Int]
+    public let candidateCellAncestorRolePaths: [String: Int]
+    public let candidateCellChildRoleCounts: [String: Int]
+    public let unverifiedContainerRolePaths: [String: Int]
+    public let knownControlPresence: [String: Bool]
     public let selectedSidebarRows: Int
     public let sidebarScopeFound: Bool
     public let messageAreaFound: Bool
@@ -70,6 +74,7 @@ public struct GeminiObservationScan: Sendable {
     public let observations: [GeminiObservation]
     public let snapshotDiagnostics: [GeminiSnapshotDiagnostic]
     public let health: String
+    public let preservedWindowIdentities: Set<String>
 }
 
 public struct GeminiLifecycleRuleFrame: Sendable {
@@ -123,19 +128,32 @@ public struct GeminiAssistantSlotDescriptor: Sendable {
     public let slotID: String
     public let hasGroup: Bool
     public let hasBodyStaticText: Bool
+    public let hasOtherBodyRole: Bool
     public let controls: [String]
 
-    public init(slotID: String, hasGroup: Bool, hasBodyStaticText: Bool, controls: [String]) {
+    public init(slotID: String, hasGroup: Bool, hasBodyStaticText: Bool,
+                hasOtherBodyRole: Bool = false, controls: [String]) {
         self.slotID = slotID
         self.hasGroup = hasGroup
         self.hasBodyStaticText = hasBodyStaticText
+        self.hasOtherBodyRole = hasOtherBodyRole
         self.controls = controls
     }
 }
 
 public enum GeminiAssistantSlotRules {
-    public static func isAssistantBodySlot(hasGroup: Bool, hasBodyStaticText: Bool) -> Bool {
-        hasGroup && hasBodyStaticText
+    private static let additionalBodyRoles: Set<String> = ["AXHeading", "AXTextArea"]
+
+    public static func isBodyRole(_ role: String) -> Bool {
+        additionalBodyRoles.contains(role)
+    }
+
+    public static func isAssistantBodySlot(
+        hasGroup: Bool,
+        hasBodyStaticText: Bool,
+        hasOtherBodyRole: Bool = false
+    ) -> Bool {
+        hasGroup && (hasBodyStaticText || hasOtherBodyRole)
     }
 
     /// Input order is oldest to newest. Controls do not affect slot selection.
@@ -143,31 +161,92 @@ public enum GeminiAssistantSlotRules {
         in orderedSlots: [GeminiAssistantSlotDescriptor]
     ) -> GeminiAssistantSlotDescriptor? {
         orderedSlots.last(where: { isAssistantBodySlot(hasGroup: $0.hasGroup,
-                                                       hasBodyStaticText: $0.hasBodyStaticText) })
+                                                       hasBodyStaticText: $0.hasBodyStaticText,
+                                                       hasOtherBodyRole: $0.hasOtherBodyRole) })
     }
 }
 
 public enum GeminiAXStructureRules {
-    private static let sidebarRoles: Set<String> = ["AXList", "AXOutline", "AXTable"]
+    private static let listLikeRoles: Set<String> = ["AXList", "AXOutline", "AXTable"]
 
     public static func isSidebarRole(_ role: String) -> Bool {
-        sidebarRoles.contains(role)
+        listLikeRoles.contains(role)
     }
 
-    public static func isSidebarBranch(role: String, ancestorRoles: [String]) -> Bool {
-        isSidebarRole(role) || ancestorRoles.contains(where: isSidebarRole)
+    public static func isVerifiedSidebarContainer(
+        role: String,
+        ancestorRoles: [String],
+        ancestorChildIndexes: [[Int]],
+        insideValidatedMessageCell: Bool = false
+    ) -> Bool {
+        guard !insideValidatedMessageCell, isSidebarRole(role),
+              let splitIndex = ancestorRoles.lastIndex(of: "AXSplitGroup"),
+              ancestorRoles.indices.contains(splitIndex + 1),
+              ancestorRoles[splitIndex + 1] == "AXGroup",
+              ancestorChildIndexes.indices.contains(splitIndex + 1),
+              ancestorChildIndexes.indices.contains(splitIndex) else { return false }
+        let splitPath = ancestorChildIndexes[splitIndex]
+        let panePath = ancestorChildIndexes[splitIndex + 1]
+        return panePath.dropLast().elementsEqual(splitPath) && panePath.last == 0
     }
 
-    public static func isMessageListGroup(role: String, ancestorRoles: [String]) -> Bool {
+    public static func isVerifiedSidebarBranch(
+        role: String,
+        ancestorRoles: [String],
+        ancestorChildIndexes: [[Int]]
+    ) -> Bool {
+        isVerifiedSidebarContainer(role: role, ancestorRoles: ancestorRoles,
+                                   ancestorChildIndexes: ancestorChildIndexes)
+            || ancestorRoles.indices.contains { index in
+                isVerifiedSidebarContainer(
+                    role: ancestorRoles[index],
+                    ancestorRoles: Array(ancestorRoles.prefix(index)),
+                    ancestorChildIndexes: Array(ancestorChildIndexes.prefix(index))
+                )
+            }
+    }
+
+    public static func isMessageListGroup(
+        role: String,
+        ancestorRoles: [String],
+        ancestorChildIndexes: [[Int]] = []
+    ) -> Bool {
         role == "AXGroup"
             && ancestorRoles.last == "AXScrollArea"
             && !ancestorRoles.contains(where: isSidebarRole)
+            && !isFirstSplitPane(ancestorRoles: ancestorRoles,
+                                 ancestorChildIndexes: ancestorChildIndexes)
     }
 
-    public static func isMessageCell(role: String, ancestorRoles: [String]) -> Bool {
+    public static func isMessageCell(
+        role: String,
+        ancestorRoles: [String],
+        ancestorChildIndexes: [[Int]] = []
+    ) -> Bool {
         role == "AXCell"
             && Array(ancestorRoles.suffix(3)) == ["AXScrollArea", "AXGroup", "AXRow"]
             && !ancestorRoles.contains(where: isSidebarRole)
+            && !isFirstSplitPane(ancestorRoles: ancestorRoles,
+                                 ancestorChildIndexes: ancestorChildIndexes)
+    }
+
+    public static func shouldStopOlderRowSearch(
+        rowHadCell: Bool,
+        rowHadUnverifiedContainer: Bool,
+        assistantBodyFound: Bool
+    ) -> Bool {
+        rowHadCell || rowHadUnverifiedContainer || assistantBodyFound
+    }
+
+    public static func diagnosticRolePath(_ roles: [String]) -> String {
+        let allowed: Set<String> = [
+            "AXApplication", "AXWindow", "AXDialog", "AXSheet", "AXGroup", "AXSplitGroup",
+            "AXToolbar", "AXScrollArea", "AXScrollBar", "AXList", "AXOutline", "AXTable",
+            "AXWebArea", "AXRow", "AXCell", "AXButton", "AXStaticText", "AXTextField",
+            "AXTextArea", "AXHeading", "AXLink", "AXImage", "AXUnknown",
+        ]
+        return roles.suffix(10).map { allowed.contains($0) ? $0 : "AXOther" }
+            .joined(separator: ">")
     }
 
     public static func childLimitInvalidatesSnapshot(
@@ -175,7 +254,21 @@ public enum GeminiAXStructureRules {
         ancestorRoles: [String],
         truncated: Bool
     ) -> Bool {
-        truncated && !isSidebarBranch(role: role, ancestorRoles: ancestorRoles)
+        truncated && !ancestorRoles.contains(where: isSidebarRole) && !isSidebarRole(role)
+    }
+
+    private static func isFirstSplitPane(
+        ancestorRoles: [String],
+        ancestorChildIndexes: [[Int]]
+    ) -> Bool {
+        guard let splitIndex = ancestorRoles.lastIndex(of: "AXSplitGroup"),
+              ancestorRoles.indices.contains(splitIndex + 1),
+              ancestorRoles[splitIndex + 1] == "AXGroup",
+              ancestorChildIndexes.indices.contains(splitIndex + 1),
+              ancestorChildIndexes.indices.contains(splitIndex) else { return false }
+        let splitPath = ancestorChildIndexes[splitIndex]
+        let panePath = ancestorChildIndexes[splitIndex + 1]
+        return panePath.dropLast().elementsEqual(splitPath) && panePath.last == 0
     }
 }
 
@@ -194,6 +287,22 @@ public enum GeminiContinuityRules {
         if wasContinuityKnown != isContinuityKnown { return true }
         if previousSessionFingerprint != currentSessionFingerprint { return true }
         return !hasConversationRoute && !selectedSidebarRowEqual
+    }
+}
+
+public enum GeminiWindowGapRules {
+    /// Retain a missing window only while its process is live and the scan
+    /// could not enumerate that process's AXWindows list.
+    public static func shouldPreserveUnseenWindow(
+        processID: Int32,
+        activeProcessIDs: Set<Int32>,
+        enumeratedProcessIDs: Set<Int32>
+    ) -> Bool {
+        activeProcessIDs.contains(processID) && !enumeratedProcessIDs.contains(processID)
+    }
+
+    public static func isWindowScanGap(reason: String) -> Bool {
+        ["window_not_scanned_budget", "window_limit_not_scanned"].contains(reason)
     }
 }
 
@@ -305,6 +414,14 @@ public enum GeminiLifecycleRules {
         state.lastState = frame.scope == .conversation ? .responseEndedInferred : .responseEndedInferredWindow
         return .init(state: state.lastState, reason: "new_latest_feedback_controls_stable_for_two_reads")
     }
+
+    /// Retain physical-window continuity after a transient window-list gap,
+    /// but discard active-run evidence. Completion then requires a fresh
+    /// observed Stop control after AX access recovers.
+    public static func resetAfterWindowListGap(state: inout GeminiLifecycleRuleState) {
+        state.resetTurn()
+        state.lastState = .unknown
+    }
 }
 
 private extension GeminiLifecycleRuleState {
@@ -331,8 +448,14 @@ public final class GeminiAdapter: @unchecked Sendable {
     public func scan() -> GeminiObservationScan {
         queue.sync {
             let snapshot = snapshotter.frames()
-            let statusEvents = tracker.update(snapshot.frames, globalReason: snapshot.globalReason)
-            let observations = statusEvents.map { event in
+            let trackerResult = tracker.update(
+                snapshot.frames,
+                globalReason: snapshot.globalReason,
+                windowListFailures: snapshot.windowListFailures,
+                activePIDs: snapshot.activePIDs,
+                enumeratedPIDs: snapshot.enumeratedPIDs
+            )
+            let observations = trackerResult.events.map { event in
                 GeminiObservation(
                     appID: event.app,
                     build: event.build,
@@ -351,15 +474,35 @@ public final class GeminiAdapter: @unchecked Sendable {
                     observedAt: event.observedAt
                 )
             }
+            let windowListHealth: String? = snapshot.windowListFailures.first?.reason
             let health = snapshot.globalReason
+                ?? windowListHealth
                 ?? (snapshot.frames.allSatisfy(\.complete)
                     ? (snapshot.frames.contains(where: \.tailWindowed)
                         ? "snapshot_complete_latest_tail_windowed" : "snapshot_complete")
                     : "snapshot_partial")
+            let diagnostics = observations.map(\.snapshotDiagnostic)
+                + snapshot.windowListFailures.map(windowListDiagnostic)
             return GeminiObservationScan(observations: observations,
-                                         snapshotDiagnostics: observations.map(\.snapshotDiagnostic),
-                                         health: health)
+                                         snapshotDiagnostics: diagnostics,
+                                         health: health,
+                                         preservedWindowIdentities: trackerResult.preservedWindowIdentities)
         }
+    }
+
+    private func windowListDiagnostic(_ failure: GeminiWindowListFailure) -> GeminiSnapshotDiagnostic {
+        GeminiSnapshotDiagnostic(
+            processID: failure.processID, windowIndex: nil, complete: false,
+            reason: failure.reason,
+            failingRole: failure.reason == "window_list_unavailable" ? "AXApplication" : nil,
+            failingAttribute: failure.reason == "window_list_unavailable" ? "AXWindows" : nil,
+            axErrorCode: failure.errorCode, elementsVisited: 0, roleCounts: [:],
+            candidateCellAncestorRolePaths: [:], candidateCellChildRoleCounts: [:],
+            unverifiedContainerRolePaths: [:], knownControlPresence: emptyGeminiControlPresence,
+            selectedSidebarRows: 0, sidebarScopeFound: false, messageAreaFound: false,
+            messageAtBottom: false, scrollBarValue: nil, tailWindowed: false,
+            elapsedMilliseconds: 0
+        )
     }
 }
 
@@ -397,6 +540,10 @@ private enum GeminiTarget {
         "AXTable", "AXTabGroup", "AXLayoutArea", "AXScrollBar", "AXUnknown"
     ]
 }
+
+private let emptyGeminiControlPresence: [String: Bool] = [
+    "stop": false, "copy": false, "thumb_up": false, "thumb_down": false, "regenerate": false,
+]
 
 private struct ProbeEvent {
     let app: String
@@ -445,6 +592,20 @@ private struct GeminiFrame {
     let snapshotDiagnostic: GeminiSnapshotDiagnostic
 }
 
+private struct GeminiWindowListFailure {
+    let processID: Int32
+    let reason: String
+    let errorCode: Int32?
+}
+
+private struct GeminiSnapshotBatch {
+    let frames: [GeminiFrame]
+    let globalReason: String?
+    let windowListFailures: [GeminiWindowListFailure]
+    let activePIDs: Set<Int32>
+    let enumeratedPIDs: Set<Int32>
+}
+
 private struct ContainerPath: Hashable {
     let role: String
     let childIndexes: [Int]
@@ -477,14 +638,17 @@ private final class CellAccumulator {
     let element: AXUIElement
     let childIndexes: [Int]
     let scrollArea: ContainerPath
+    let depth: Int
     var hasGroup = false
     var hasBodyStaticText = false
+    var hasOtherBodyRole = false
     var controls: Set<String> = []
 
-    init(element: AXUIElement, childIndexes: [Int], scrollArea: ContainerPath) {
+    init(element: AXUIElement, childIndexes: [Int], scrollArea: ContainerPath, depth: Int) {
         self.element = element
         self.childIndexes = childIndexes
         self.scrollArea = scrollArea
+        self.depth = depth
     }
 }
 
@@ -501,6 +665,10 @@ private struct GeminiTreeDiagnostic {
     let failingAttribute: String?
     let axErrorCode: Int32?
     let roleCounts: [String: Int]
+    let candidateCellAncestorRolePaths: [String: Int]
+    let candidateCellChildRoleCounts: [String: Int]
+    let unverifiedContainerRolePaths: [String: Int]
+    let knownControlPresence: [String: Bool]
     let selectedSidebarRows: Int
     let sidebarScopeFound: Bool
     let messageAreaFound: Bool
@@ -540,12 +708,21 @@ private struct WindowTreeResult {
     var stopVisible = false
     var taskToolbarCompleted = false
     var assistantRows: [([Int], ResponseRow)] = []
+    var validatedMessageCellCount = 0
+    var unverifiedMessageContainerCount = 0
     var scrollBarValues: [ContainerPath: Double] = [:]
     var messageAreaScrollArea: ContainerPath?
     var sidebarScopeFound = false
     var latestTailWindowed = false
     var complete = true
     var elementsVisited = 0
+    var candidateCellAncestorRolePaths: [String: Int] = [:]
+    var candidateCellChildRoleCounts: [String: Int] = [:]
+    var unverifiedContainerRolePaths: [String: Int] = [:]
+    var diagnosticCellSamples = 0
+    var diagnosticContainerSamples = 0
+    var diagnosticRoleReads = 0
+    var seenControlSemantics: Set<String> = []
     var buttons: [ButtonOccurrence] = []
     var toolbars: [ToolbarOccurrence] = []
     var selectedSidebarRows: [AXUIElement] = []
@@ -556,6 +733,10 @@ private final class WindowTreeReader {
     private let maxElements = 180
     private let maxDepth = 12
     private let maxChildren = 60
+    private let maxDiagnosticCellSamples = 4
+    private let maxDiagnosticChildRoles = 16
+    private let maxDiagnosticPathKeys = 16
+    private let maxDiagnosticRoleReads = 64
     private let messageTimeout: Float = 0.15
     private var deadline = 0.0
     private var collectSidebarIdentity = true
@@ -618,10 +799,19 @@ private final class WindowTreeReader {
             result.complete = false
             recordFailure("required_role_unavailable", role: nil, attribute: "AXRole",
                           errorCode: lastAXErrorCode)
+            if isDirectMessageListChild(ancestors) {
+                result.unverifiedMessageContainerCount += 1
+                recordUnverifiedMessagePath(ancestors.map(\.role) + ["AXOther"], result: &result)
+            }
             return
         }
         let safeRole = knownRoles.contains(role) ? role : "AXOther"
         roleCounts[safeRole, default: 0] += 1
+        if let cell, depth > cell.depth, depth <= cell.depth + 3,
+           result.diagnosticRoleReads < maxDiagnosticRoleReads {
+            result.candidateCellChildRoleCounts[safeRole, default: 0] += 1
+            result.diagnosticRoleReads += 1
+        }
         if depth == 0, role != "AXWindow" {
             result.complete = false
             recordFailure("unexpected_window_role", role: role, attribute: "AXRole", errorCode: nil)
@@ -630,19 +820,35 @@ private final class WindowTreeReader {
 
         if role == "AXCell" {
             let ancestorRoles = ancestors.map(\.role)
-            guard GeminiAXStructureRules.isMessageCell(role: role, ancestorRoles: ancestorRoles),
-                  let scrollIndex = ancestors.lastIndex(where: { $0.role == "AXScrollArea" }) else { return }
+            let isMessageCell = GeminiAXStructureRules.isMessageCell(
+                role: role,
+                ancestorRoles: ancestorRoles,
+                ancestorChildIndexes: ancestors.map(\.childIndexes)
+            )
+            recordCandidateCellPath(ancestorRoles + [role], element: element,
+                                    sampleChildren: !isMessageCell, result: &result)
+            guard isMessageCell,
+                  let scrollIndex = ancestors.lastIndex(where: { $0.role == "AXScrollArea" }) else {
+                if isWithinMessageListContent(ancestors) {
+                    result.unverifiedMessageContainerCount += 1
+                    recordUnverifiedMessagePath(ancestorRoles + [role], result: &result)
+                }
+                return
+            }
+            result.validatedMessageCellCount += 1
             let scrollArea = ancestors[scrollIndex]
+            result.messageAreaScrollArea = scrollArea
             let accumulator = CellAccumulator(element: element,
                                               childIndexes: childIndexes,
-                                              scrollArea: scrollArea)
+                                              scrollArea: scrollArea,
+                                              depth: depth)
             walkChildren(of: element, role: role, depth: depth, childIndexes: childIndexes,
                          ancestors: ancestors, cell: accumulator, result: &result)
             if GeminiAssistantSlotRules.isAssistantBodySlot(
                 hasGroup: accumulator.hasGroup,
-                hasBodyStaticText: accumulator.hasBodyStaticText
+                hasBodyStaticText: accumulator.hasBodyStaticText,
+                hasOtherBodyRole: accumulator.hasOtherBodyRole
             ) {
-                result.messageAreaScrollArea = scrollArea
                 result.assistantRows.append((childIndexes, ResponseRow(
                     key: ContainerPath(role: "AXCell", childIndexes: childIndexes).stableText,
                     order: childIndexes.dropLast().last ?? 0,
@@ -662,8 +868,28 @@ private final class WindowTreeReader {
             return
         }
         if GeminiAXStructureRules.isSidebarRole(role) {
-            result.sidebarScopeFound = true
-            collectSelectedSidebarRows(in: element, result: &result)
+            recordUnverifiedContainerPath(ancestors.map(\.role) + [role],
+                                          element: element, result: &result)
+            let verifiedSidebar = GeminiAXStructureRules.isVerifiedSidebarContainer(
+                role: role,
+                ancestorRoles: ancestors.map(\.role),
+                ancestorChildIndexes: ancestors.map(\.childIndexes),
+                insideValidatedMessageCell: cell != nil
+            )
+            if cell != nil {
+                // A list inside a validated message cell is message content,
+                // never a sidebar. Count the role but do not traverse its rows.
+                cell?.hasOtherBodyRole = true
+                return
+            }
+            if verifiedSidebar {
+                result.sidebarScopeFound = true
+                collectSelectedSidebarRows(in: element, result: &result)
+            } else if isDirectMessageListChild(ancestors) {
+                result.unverifiedMessageContainerCount += 1
+            } else if isWithinMessageListContent(ancestors) {
+                result.unverifiedMessageContainerCount += 1
+            }
             return
         }
         if role == "AXButton" {
@@ -672,11 +898,29 @@ private final class WindowTreeReader {
         }
         if role == "AXStaticText" {
             cell?.hasBodyStaticText = true
+            if cell == nil, isWithinMessageListContent(ancestors) {
+                result.unverifiedMessageContainerCount += 1
+                recordUnverifiedMessagePath(ancestors.map(\.role) + [role], result: &result)
+            }
+            return
+        }
+        if GeminiAssistantSlotRules.isBodyRole(role) {
+            cell?.hasOtherBodyRole = true
+            if cell == nil, isWithinMessageListContent(ancestors) {
+                result.unverifiedMessageContainerCount += 1
+                recordUnverifiedMessagePath(ancestors.map(\.role) + [role], result: &result)
+            }
             return
         }
         // Gemini's main app is native SwiftUI. Embedded WebAreas are previews;
         // their controls must never be interpreted as the native composer.
-        guard GeminiTarget.containerRoles.contains(role) else { return }
+        guard GeminiTarget.containerRoles.contains(role) else {
+            if isDirectMessageListChild(ancestors) {
+                result.unverifiedMessageContainerCount += 1
+                recordUnverifiedMessagePath(ancestors.map(\.role) + ["AXOther"], result: &result)
+            }
+            return
+        }
 
         let currentPath = ContainerPath(role: role, childIndexes: childIndexes)
         if role == "AXToolbar" {
@@ -686,8 +930,13 @@ private final class WindowTreeReader {
 
         let ancestorRoles = ancestors.map(\.role)
         let isMessageList = GeminiAXStructureRules.isMessageListGroup(
-            role: role, ancestorRoles: ancestorRoles
+            role: role,
+            ancestorRoles: ancestorRoles,
+            ancestorChildIndexes: ancestors.map(\.childIndexes)
         )
+        if isMessageList, let scrollArea = ancestors.last {
+            result.messageAreaScrollArea = scrollArea
+        }
         guard let childrenResult = childElements(element, role: role, tailIfLarge: isMessageList) else {
             // Leaf or unsupported containers do not contain evidence. Marking the
             // snapshot incomplete prevents a partial AX read from ending a task.
@@ -703,23 +952,44 @@ private final class WindowTreeReader {
         if childrenResult.skippedPrefix { result.latestTailWindowed = true }
 
         if isMessageList {
-            // This is the verified message-list role path. Read its newest rows
-            // first and stop on the latest body-bearing assistant cell. Older
-            // message cells cannot change which row is latest.
-            let priorRowCount = result.assistantRows.count
+            // Read newest rows first. Any validated cell or unverified content
+            // container blocks history fallback, even when no assistant slot
+            // can be identified in that newest row.
             for offset in childrenResult.elements.indices.reversed() {
                 let childIndex = childrenResult.startIndex + offset
+                let priorCellCount = result.validatedMessageCellCount
+                let priorUnverifiedCount = result.unverifiedMessageContainerCount
+                let priorAssistantRowCount = result.assistantRows.count
                 walk(childrenResult.elements[offset], depth: depth + 1,
                      childIndexes: childIndexes + [childIndex],
                      ancestors: ancestors + [currentPath], cell: cell, result: &result)
-                if result.assistantRows.count > priorRowCount { break }
+                let assistantBodyFound = result.assistantRows.count > priorAssistantRowCount
+                if GeminiAXStructureRules.shouldStopOlderRowSearch(
+                    rowHadCell: result.validatedMessageCellCount > priorCellCount,
+                    rowHadUnverifiedContainer: result.unverifiedMessageContainerCount > priorUnverifiedCount,
+                    assistantBodyFound: assistantBodyFound
+                ) {
+                    break
+                }
             }
             return
         }
 
+        let isDirectMessageContainer = ["AXRow", "AXGroup"].contains(role)
+            && isDirectMessageListChild(ancestors)
+        let priorCellCount = result.validatedMessageCellCount
+        let priorUnverifiedCount = result.unverifiedMessageContainerCount
         walkChildren(of: element, role: role, depth: depth, childIndexes: childIndexes,
                      ancestors: ancestors, cell: cell, result: &result,
                      knownChildren: childrenResult)
+        if isDirectMessageContainer,
+           result.validatedMessageCellCount == priorCellCount,
+           result.unverifiedMessageContainerCount == priorUnverifiedCount {
+            // This newest row has no validated cell or recognized body. It
+            // blocks looking behind it for stale completed-response controls.
+            result.unverifiedMessageContainerCount += 1
+            recordUnverifiedMessagePath(ancestorRoles + [role], result: &result)
+        }
     }
 
     private func walkChildren(
@@ -768,6 +1038,10 @@ private final class WindowTreeReader {
         result.buttons.append(ButtonOccurrence(identifier: identifier, element: element, ancestors: ancestors))
         if let identifier, GeminiTarget.safeButtonIdentifiers.contains(identifier) {
             cell?.controls.insert(identifier)
+            if cell == nil, isWithinMessageListContent(ancestors) {
+                result.unverifiedMessageContainerCount += 1
+                recordUnverifiedMessagePath(ancestors.map(\.role) + ["AXButton"], result: &result)
+            }
         }
         if identifier == "stop_button" { result.stopVisible = true }
     }
@@ -841,6 +1115,97 @@ private final class WindowTreeReader {
         let remaining = deadline - systemUptime
         guard remaining > 0 else { return false }
         return AXUIElementSetMessagingTimeout(element, min(messageTimeout, Float(remaining))) == .success
+    }
+
+    private func recordCandidateCellPath(_ roles: [String], element: AXUIElement,
+                                         sampleChildren: Bool,
+                                         result: inout WindowTreeResult) {
+        let path = GeminiAXStructureRules.diagnosticRolePath(roles)
+        if result.candidateCellAncestorRolePaths[path] != nil
+            || result.candidateCellAncestorRolePaths.count < maxDiagnosticPathKeys {
+            result.candidateCellAncestorRolePaths[path, default: 0] += 1
+        }
+        guard sampleChildren, result.diagnosticCellSamples < maxDiagnosticCellSamples else { return }
+        result.diagnosticCellSamples += 1
+        let remainingRoleReads = max(0, maxDiagnosticRoleReads - result.diagnosticRoleReads)
+        guard remainingRoleReads > 0 else { return }
+        let childRoleLimit = min(maxDiagnosticChildRoles, remainingRoleReads)
+        for role in diagnosticDirectChildRoles(of: element, limit: childRoleLimit) {
+            result.diagnosticRoleReads += 1
+            let safeRole = knownRoles.contains(role) ? role : "AXOther"
+            result.candidateCellChildRoleCounts[safeRole, default: 0] += 1
+        }
+    }
+
+    private func recordUnverifiedContainerPath(_ roles: [String], element: AXUIElement,
+                                               result: inout WindowTreeResult) {
+        let path = GeminiAXStructureRules.diagnosticRolePath(roles)
+        if result.unverifiedContainerRolePaths[path] != nil
+            || result.unverifiedContainerRolePaths.count < maxDiagnosticPathKeys {
+            result.unverifiedContainerRolePaths[path, default: 0] += 1
+        }
+        guard result.diagnosticContainerSamples < maxDiagnosticCellSamples else { return }
+        result.diagnosticContainerSamples += 1
+        let remainingRoleReads = max(0, maxDiagnosticRoleReads - result.diagnosticRoleReads)
+        guard remainingRoleReads > 0 else { return }
+        let childRoleLimit = min(maxDiagnosticChildRoles, remainingRoleReads)
+        for role in diagnosticDirectChildRoles(of: element, limit: childRoleLimit) {
+            result.diagnosticRoleReads += 1
+            let safeRole = knownRoles.contains(role) ? role : "AXOther"
+            result.candidateCellChildRoleCounts[safeRole, default: 0] += 1
+        }
+    }
+
+    private func recordUnverifiedMessagePath(_ roles: [String], result: inout WindowTreeResult) {
+        let path = GeminiAXStructureRules.diagnosticRolePath(roles)
+        if result.unverifiedContainerRolePaths[path] != nil
+            || result.unverifiedContainerRolePaths.count < maxDiagnosticPathKeys {
+            result.unverifiedContainerRolePaths[path, default: 0] += 1
+        }
+    }
+
+    private func isDirectMessageListChild(_ ancestors: [ContainerPath]) -> Bool {
+        guard let parentGroup = ancestors.last, parentGroup.role == "AXGroup" else { return false }
+        let parentAncestors = Array(ancestors.dropLast())
+        return GeminiAXStructureRules.isMessageListGroup(
+            role: parentGroup.role,
+            ancestorRoles: parentAncestors.map(\.role),
+            ancestorChildIndexes: parentAncestors.map(\.childIndexes)
+        )
+    }
+
+    private func isWithinMessageListContent(_ ancestors: [ContainerPath]) -> Bool {
+        for index in ancestors.indices where ancestors[index].role == "AXGroup" {
+            let prefix = Array(ancestors.prefix(index))
+            if GeminiAXStructureRules.isMessageListGroup(
+                role: "AXGroup",
+                ancestorRoles: prefix.map(\.role),
+                ancestorChildIndexes: prefix.map(\.childIndexes)
+            ) {
+                return true
+            }
+        }
+        return false
+    }
+
+    private func diagnosticDirectChildRoles(of element: AXUIElement, limit maximum: Int? = nil) -> [String] {
+        guard quietlyConfigureTimeout(for: element) else { return [] }
+        var count: CFIndex = 0
+        guard AXUIElementGetAttributeValueCount(element, "AXChildren" as CFString, &count) == .success,
+              count > 0 else { return [] }
+        let roleLimit = maximum ?? maxDiagnosticChildRoles
+        let limit = min(count, CFIndex(max(0, roleLimit)))
+        guard limit > 0 else { return [] }
+        var copied: CFArray?
+        guard quietlyConfigureTimeout(for: element),
+              AXUIElementCopyAttributeValues(element, "AXChildren" as CFString, 0, limit, &copied) == .success,
+              let copied else { return [] }
+        let array = accessibilityElements(copied, expectedCount: Int(limit))
+        guard array.failure == nil else { return [] }
+        return array.elements.compactMap { child in
+            guard quietlyConfigureTimeout(for: child) else { return nil }
+            return stringAttribute(child, "AXRole")
+        }
     }
 
     private func finish(result: inout WindowTreeResult) {
@@ -1000,7 +1365,7 @@ private final class WindowTreeReader {
 
     private func safeAttribute(_ attribute: String?) -> String? {
         guard let attribute else { return nil }
-        let allowed: Set<String> = ["AXRole", "AXChildren", "AXSelectedChildren", "AXSelected",
+        let allowed: Set<String> = ["AXRole", "AXChildren", "AXWindows", "AXSelectedChildren", "AXSelected",
                                     "AXIdentifier", "AXDescription", "AXValue", "AXDocument", "AXURL"]
         return allowed.contains(attribute) ? attribute : "AXOtherAttribute"
     }
@@ -1013,6 +1378,10 @@ private final class WindowTreeReader {
             failingAttribute: firstFailure?.attribute,
             axErrorCode: firstFailure?.errorCode,
             roleCounts: roleCounts,
+            candidateCellAncestorRolePaths: result.candidateCellAncestorRolePaths,
+            candidateCellChildRoleCounts: result.candidateCellChildRoleCounts,
+            unverifiedContainerRolePaths: result.unverifiedContainerRolePaths,
+            knownControlPresence: controlPresence(in: result),
             selectedSidebarRows: result.selectedSidebarRows.count,
             sidebarScopeFound: result.sidebarScopeFound,
             messageAreaFound: result.messageAreaScrollArea != nil,
@@ -1021,6 +1390,18 @@ private final class WindowTreeReader {
             elementsVisited: result.elementsVisited,
             elapsedMilliseconds: max(0, Int((systemUptime - startedAt) * 1_000))
         )
+    }
+
+    private func controlPresence(in result: WindowTreeResult) -> [String: Bool] {
+        let identifiers = Set(result.buttons.compactMap(\.identifier)
+            .filter(GeminiTarget.safeButtonIdentifiers.contains))
+        return [
+            "stop": identifiers.contains("stop_button"),
+            "copy": identifiers.contains("copy-button"),
+            "thumb_up": identifiers.contains("thumb-up-unselected"),
+            "thumb_down": identifiers.contains("thumb-down-unselected"),
+            "regenerate": identifiers.contains("regen") || identifiers.contains("regen_button"),
+        ]
     }
 
     private var systemUptime: TimeInterval {
@@ -1032,37 +1413,62 @@ private final class GeminiAXSnapshotter {
     private let maxWindowsPerScan = 4
     private let scanBudgetSeconds: TimeInterval = 3.0
 
-    func frames() -> (frames: [GeminiFrame], globalReason: String?) {
+    func frames() -> GeminiSnapshotBatch {
         let scanDeadline = ProcessInfo.processInfo.systemUptime + scanBudgetSeconds
-        guard AXIsProcessTrusted() else { return ([], "accessibility_not_trusted") }
+        guard AXIsProcessTrusted() else {
+            return GeminiSnapshotBatch(frames: [], globalReason: "accessibility_not_trusted",
+                                       windowListFailures: [], activePIDs: [], enumeratedPIDs: [])
+        }
         let appURL = URL(fileURLWithPath: GeminiTarget.appPath, isDirectory: true)
         guard let bundle = Bundle(url: appURL),
               bundle.bundleIdentifier == GeminiTarget.bundleID else {
-            return ([], "installed_app_mismatch")
+            return GeminiSnapshotBatch(frames: [], globalReason: "installed_app_mismatch",
+                                       windowListFailures: [], activePIDs: [], enumeratedPIDs: [])
         }
         let installedBuild = bundle.object(forInfoDictionaryKey: "CFBundleVersion") as? String
         guard installedBuild == GeminiTarget.supportedBuild else {
-            return ([], "unsupported_build")
+            return GeminiSnapshotBatch(frames: [], globalReason: "unsupported_build",
+                                       windowListFailures: [], activePIDs: [], enumeratedPIDs: [])
         }
 
         let applications = NSWorkspace.shared.runningApplications.filter {
             $0.bundleIdentifier == GeminiTarget.bundleID && !$0.isTerminated
         }
-        guard !applications.isEmpty else { return ([], "app_not_running") }
+        let activePIDs = Set(applications.map(\.processIdentifier))
+        guard !applications.isEmpty else {
+            return GeminiSnapshotBatch(frames: [], globalReason: "app_not_running",
+                                       windowListFailures: [], activePIDs: [], enumeratedPIDs: [])
+        }
 
         var output: [GeminiFrame] = []
+        var windowListFailures: [GeminiWindowListFailure] = []
+        var enumeratedPIDs = Set<Int32>()
         let reader = WindowTreeReader()
-        for application in applications {
+        for (applicationIndex, application) in applications.enumerated() {
             guard ProcessInfo.processInfo.systemUptime < scanDeadline else {
-                return (output, "scan_deadline_exhausted")
+                windowListFailures.append(contentsOf: applications.dropFirst(applicationIndex).map {
+                    GeminiWindowListFailure(processID: $0.processIdentifier,
+                                            reason: "scan_deadline_exhausted", errorCode: nil)
+                })
+                break
             }
             guard application.bundleURL?.standardizedFileURL.path == GeminiTarget.appPath else {
-                return ([], "running_app_path_mismatch")
+                return GeminiSnapshotBatch(frames: [], globalReason: "running_app_path_mismatch",
+                                           windowListFailures: [], activePIDs: [], enumeratedPIDs: [])
             }
             let appElement = AXUIElementCreateApplication(application.processIdentifier)
             _ = AXUIElementSetMessagingTimeout(appElement, 0.15)
-            let windows = copyElementArray(appElement, attribute: "AXWindows")
-            guard let windows else { return ([], "window_list_unavailable") }
+            var windowListErrorCode: Int32?
+            guard let windows = copyElementArray(appElement, attribute: "AXWindows",
+                                                 errorCode: &windowListErrorCode) else {
+                windowListFailures.append(GeminiWindowListFailure(
+                    processID: application.processIdentifier,
+                    reason: "window_list_unavailable",
+                    errorCode: windowListErrorCode
+                ))
+                continue
+            }
+            enumeratedPIDs.insert(application.processIdentifier)
 
             let indexedWindows = prioritizeFocusedWindow(windows, appElement: appElement)
             let windowsToScan = Array(indexedWindows.prefix(maxWindowsPerScan))
@@ -1102,6 +1508,10 @@ private final class GeminiAXSnapshotter {
                     axErrorCode: treeDiagnostic?.axErrorCode,
                     elementsVisited: tree.elementsVisited,
                     roleCounts: treeDiagnostic?.roleCounts ?? [:],
+                    candidateCellAncestorRolePaths: treeDiagnostic?.candidateCellAncestorRolePaths ?? [:],
+                    candidateCellChildRoleCounts: treeDiagnostic?.candidateCellChildRoleCounts ?? [:],
+                    unverifiedContainerRolePaths: treeDiagnostic?.unverifiedContainerRolePaths ?? [:],
+                    knownControlPresence: treeDiagnostic?.knownControlPresence ?? emptyGeminiControlPresence,
                     selectedSidebarRows: tree.selectedSidebarRows.count,
                     sidebarScopeFound: treeDiagnostic?.sidebarScopeFound ?? false,
                     messageAreaFound: treeDiagnostic?.messageAreaFound ?? false,
@@ -1129,7 +1539,10 @@ private final class GeminiAXSnapshotter {
                                                  reason: "window_limit_not_scanned"))
             }
         }
-        return (output, nil)
+        return GeminiSnapshotBatch(frames: output, globalReason: nil,
+                                   windowListFailures: windowListFailures,
+                                   activePIDs: activePIDs,
+                                   enumeratedPIDs: enumeratedPIDs)
     }
 
     private func prioritizeFocusedWindow(
@@ -1158,7 +1571,9 @@ private final class GeminiAXSnapshotter {
         let diagnostic = GeminiSnapshotDiagnostic(
             processID: pid, windowIndex: windowIndex, complete: false, reason: reason,
             failingRole: nil, failingAttribute: nil, axErrorCode: nil, elementsVisited: 0,
-            roleCounts: [:], selectedSidebarRows: 0, sidebarScopeFound: false,
+            roleCounts: [:], candidateCellAncestorRolePaths: [:], candidateCellChildRoleCounts: [:],
+            unverifiedContainerRolePaths: [:], knownControlPresence: emptyGeminiControlPresence,
+            selectedSidebarRows: 0, sidebarScopeFound: false,
             messageAreaFound: false, messageAtBottom: false, scrollBarValue: nil,
             tailWindowed: false, elapsedMilliseconds: 0
         )
@@ -1224,11 +1639,15 @@ private final class GeminiAXSnapshotter {
         return copied as? String
     }
 
-    private func copyElementArray(_ element: AXUIElement, attribute: String) -> [AXUIElement]? {
+    private func copyElementArray(_ element: AXUIElement, attribute: String,
+                                  errorCode: inout Int32?) -> [AXUIElement]? {
         var copied: CFTypeRef?
         let result = AXUIElementCopyAttributeValue(element, attribute as CFString, &copied)
-        guard result == .success, let copied,
-              CFGetTypeID(copied) == CFArrayGetTypeID() else { return nil }
+        guard result == .success, let copied else {
+            errorCode = Int32(result.rawValue)
+            return nil
+        }
+        guard CFGetTypeID(copied) == CFArrayGetTypeID() else { return nil }
         let arrayResult = accessibilityElements(unsafeDowncast(copied, to: CFArray.self))
         guard arrayResult.failure == nil else { return nil }
         return arrayResult.elements
@@ -1241,12 +1660,15 @@ private func fingerprint(_ identifier: String) -> String {
 }
 
 private struct WindowTracker {
+    var processID: Int32
+    var windowIndex: Int
     var windowIdentity: String?
     var continuityEpoch: UInt64 = 0
     var hasSeenFrame = false
     var continuityKnown = false
     var sessionFingerprint: String?
     var selectedSidebarRow: AXUIElement?
+    var scope = "unbound"
     var ruleState = GeminiLifecycleRuleState()
 }
 
@@ -1255,11 +1677,22 @@ private struct TrackedWindowIdentity {
     let element: AXUIElement
 }
 
+private struct GeminiStatusTrackerUpdate {
+    let events: [ProbeEvent]
+    let preservedWindowIdentities: Set<String>
+}
+
 private final class GeminiStatusTracker {
     private var trackers: [String: WindowTracker] = [:]
     private var windowIdentities: [Int32: [TrackedWindowIdentity]] = [:]
 
-    func update(_ frames: [GeminiFrame], globalReason: String?) -> [ProbeEvent] {
+    func update(
+        _ frames: [GeminiFrame],
+        globalReason: String?,
+        windowListFailures: [GeminiWindowListFailure],
+        activePIDs: Set<Int32>,
+        enumeratedPIDs: Set<Int32>
+    ) -> GeminiStatusTrackerUpdate {
         let now = Date()
         var events: [ProbeEvent] = []
 
@@ -1269,21 +1702,49 @@ private final class GeminiStatusTracker {
             let diagnostic = GeminiSnapshotDiagnostic(
                 processID: nil, windowIndex: nil, complete: false, reason: globalReason,
                 failingRole: nil, failingAttribute: nil, axErrorCode: nil, elementsVisited: 0,
-                roleCounts: [:], selectedSidebarRows: 0, sidebarScopeFound: false,
+                roleCounts: [:], candidateCellAncestorRolePaths: [:],
+                candidateCellChildRoleCounts: [:], unverifiedContainerRolePaths: [:],
+                knownControlPresence: emptyGeminiControlPresence,
+                selectedSidebarRows: 0, sidebarScopeFound: false,
                 messageAreaFound: false, messageAtBottom: false, scrollBarValue: nil,
                 tailWindowed: false, elapsedMilliseconds: 0
             )
-            return [event(pid: nil, window: nil, windowIdentity: nil, continuityEpoch: 0,
-                          session: nil, scope: "unbound", status: "unknown",
-                          reason: globalReason, taskToolbarCompleted: false, row: nil,
-                          snapshotDiagnostic: diagnostic, now: now)]
+            events.append(event(pid: nil, window: nil, windowIdentity: nil, continuityEpoch: 0,
+                                session: nil, scope: "unbound", status: "unknown",
+                                reason: globalReason, taskToolbarCompleted: false, row: nil,
+                                snapshotDiagnostic: diagnostic, now: now))
+            return GeminiStatusTrackerUpdate(events: events, preservedWindowIdentities: [])
         }
 
-        let identifiedFrames = assignWindowIdentities(frames)
+        let unenumeratedLivePIDs = activePIDs.subtracting(enumeratedPIDs)
+        let identifiedFrames = assignWindowIdentities(frames, preservingPIDs: unenumeratedLivePIDs)
         let seenKeys = Set(identifiedFrames.map { "\($0.frame.pid):\($0.identity)" })
+        var preservedWindowIdentities = Set<String>()
         for (frame, identity) in identifiedFrames {
             let key = "\(frame.pid):\(identity)"
-            var tracker = trackers[key] ?? WindowTracker(windowIdentity: identity)
+            if GeminiWindowGapRules.isWindowScanGap(reason: frame.reason) {
+                var tracker = trackers[key] ?? WindowTracker(processID: frame.pid,
+                                                            windowIndex: frame.windowIndex,
+                                                            windowIdentity: identity)
+                tracker.windowIdentity = identity
+                tracker.windowIndex = frame.windowIndex
+                GeminiLifecycleRules.resetAfterWindowListGap(state: &tracker.ruleState)
+                trackers[key] = tracker
+                preservedWindowIdentities.insert(identity)
+                events.append(event(
+                    pid: frame.pid, window: frame.windowIndex,
+                    windowIdentity: identity, continuityEpoch: tracker.continuityEpoch,
+                    session: tracker.sessionFingerprint, scope: tracker.scope,
+                    status: GeminiObservedState.unknown.rawValue, reason: frame.reason,
+                    taskToolbarCompleted: false, row: nil,
+                    snapshotDiagnostic: frame.snapshotDiagnostic, now: now
+                ))
+                continue
+            }
+
+            var tracker = trackers[key] ?? WindowTracker(processID: frame.pid,
+                                                        windowIndex: frame.windowIndex,
+                                                        windowIdentity: identity)
             let scope = observationScope(for: frame)
             let continuityKnown = frame.complete && scope != "unbound"
             let selectedSidebarRowEqual = sameElement(tracker.selectedSidebarRow, frame.selectedSidebarRow)
@@ -1304,6 +1765,8 @@ private final class GeminiStatusTracker {
             tracker.sessionFingerprint = frame.sessionFingerprint
             tracker.selectedSidebarRow = frame.selectedSidebarRow
             tracker.windowIdentity = identity
+            tracker.windowIndex = frame.windowIndex
+            tracker.scope = scope
 
             let latestRow = frame.latestResponseRow
             let ruleFrame = GeminiLifecycleRuleFrame(
@@ -1330,13 +1793,59 @@ private final class GeminiStatusTracker {
                                 now: now))
         }
 
-        for key in trackers.keys where !seenKeys.contains(key) {
-            trackers.removeValue(forKey: key)
+        let failureByPID = Dictionary(grouping: windowListFailures, by: \.processID)
+        for (key, existingTracker) in Array(trackers) {
+            guard GeminiWindowGapRules.shouldPreserveUnseenWindow(
+                processID: existingTracker.processID,
+                activeProcessIDs: activePIDs,
+                enumeratedProcessIDs: enumeratedPIDs
+            ) else { continue }
+            guard !seenKeys.contains(key), let identity = existingTracker.windowIdentity else { continue }
+
+            var tracker = existingTracker
+            GeminiLifecycleRules.resetAfterWindowListGap(state: &tracker.ruleState)
+            trackers[key] = tracker
+            preservedWindowIdentities.insert(identity)
+            let failure = failureByPID[tracker.processID]?.first
+            let reason = failure?.reason ?? "window_list_unavailable"
+            let diagnostic = GeminiSnapshotDiagnostic(
+                processID: tracker.processID, windowIndex: tracker.windowIndex,
+                complete: false, reason: reason,
+                failingRole: reason == "window_list_unavailable" ? "AXApplication" : nil,
+                failingAttribute: reason == "window_list_unavailable" ? "AXWindows" : nil,
+                axErrorCode: failure?.errorCode, elementsVisited: 0, roleCounts: [:],
+                candidateCellAncestorRolePaths: [:], candidateCellChildRoleCounts: [:],
+                unverifiedContainerRolePaths: [:], knownControlPresence: emptyGeminiControlPresence,
+                selectedSidebarRows: 0, sidebarScopeFound: false, messageAreaFound: false,
+                messageAtBottom: false, scrollBarValue: nil, tailWindowed: false,
+                elapsedMilliseconds: 0
+            )
+            events.append(event(
+                pid: tracker.processID, window: tracker.windowIndex,
+                windowIdentity: identity, continuityEpoch: tracker.continuityEpoch,
+                session: tracker.sessionFingerprint, scope: tracker.scope,
+                status: GeminiObservedState.unknown.rawValue, reason: reason,
+                taskToolbarCompleted: false, row: nil,
+                snapshotDiagnostic: diagnostic, now: now
+            ))
         }
-        return events
+
+        for (key, tracker) in Array(trackers) where !seenKeys.contains(key) {
+            if !GeminiWindowGapRules.shouldPreserveUnseenWindow(
+                processID: tracker.processID,
+                activeProcessIDs: activePIDs,
+                enumeratedProcessIDs: enumeratedPIDs
+            ) {
+                trackers.removeValue(forKey: key)
+            }
+        }
+        return GeminiStatusTrackerUpdate(events: events,
+                                         preservedWindowIdentities: preservedWindowIdentities)
     }
 
-    private func assignWindowIdentities(_ frames: [GeminiFrame]) -> [(frame: GeminiFrame, identity: String)] {
+    private func assignWindowIdentities(
+        _ frames: [GeminiFrame], preservingPIDs: Set<Int32>
+    ) -> [(frame: GeminiFrame, identity: String)] {
         var nextByProcess: [Int32: [TrackedWindowIdentity]] = [:]
         var usedByProcess: [Int32: Set<String>] = [:]
         var identified: [(GeminiFrame, String)] = []
@@ -1354,6 +1863,9 @@ private final class GeminiStatusTracker {
             identified.append((frame, identity))
         }
 
+        for pid in preservingPIDs {
+            nextByProcess[pid] = windowIdentities[pid] ?? []
+        }
         windowIdentities = nextByProcess
         return identified
     }

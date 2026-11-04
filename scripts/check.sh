@@ -52,8 +52,10 @@ python3 "$project_dir/Tests/check_antigravity.py"
 python3 "$project_dir/Tests/check_codex_rollouts.py"
 python3 "$project_dir/Tests/check_claude_desktop.py"
 python3 "$project_dir/Tests/check_claude_code_records.py"
-compile_check -swift-version 6 -parse-as-library \
+compile_check -swift-version 6 -parse-as-library -I "$binary_dir/Modules" \
+  "$binary_dir/AgentWatchCore.build/"*.swift.o \
   "$project_dir/Sources/AgentWatchMonitor/GeminiAdapter.swift" \
+  "$project_dir/Sources/AgentWatchMonitor/GeminiEvents.swift" \
   "$project_dir/Tests/GeminiAdapterChecks.swift" -o "$build_dir/gemini-checks"
 "$build_dir/gemini-checks"
 compile_check -swift-version 6 -parse-as-library -I "$binary_dir/Modules" \
