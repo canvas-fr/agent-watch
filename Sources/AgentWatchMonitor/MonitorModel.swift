@@ -115,6 +115,17 @@ final class MonitorModel: NSObject, ObservableObject, UNUserNotificationCenterDe
                 do { try await Task.sleep(for: .seconds(1)) } catch { return }
             }
         }
+        // Explicit startup options support the normal OS permission flow;
+        // they request consent and never grant access programmatically.
+        if CommandLine.arguments.contains("--request-accessibility")
+            || CommandLine.arguments.contains("--request-notifications") {
+            Task { [weak self] in
+                await Task.yield()
+                guard let self else { return }
+                if CommandLine.arguments.contains("--request-accessibility") { self.grantAccessibility() }
+                if CommandLine.arguments.contains("--request-notifications") { self.grantNotifications() }
+            }
+        }
     }
 
     var attentionCount: Int { sessions.filter { $0.state.needsAttention && !$0.stale }.count }
