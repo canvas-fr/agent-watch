@@ -4,13 +4,30 @@ import SwiftUI
 import UserNotifications
 import AgentWatchCore
 
+struct FloatingAlertKey: Hashable {
+    let appID: String
+    let sessionID: String
+    let turnID: String
+    let state: SessionState
+}
+
+extension FloatingAlertKey {
+    init(_ session: SessionSnapshot) {
+        self.init(appID: session.appID, sessionID: session.sessionID, turnID: session.turnID, state: session.state)
+    }
+}
+
 @MainActor
 final class MonitorModel: NSObject, ObservableObject, UNUserNotificationCenterDelegate {
     @Published var sessions: [SessionSnapshot] = []
     @Published var diagnostics: [String: String] = [:]
-    @Published var runningApps = Set<String>()
+    @Published private(set) var runningBundleIDs = Set<String>()
     @Published var lastScan: Date?
-    @Published var paused = false
+    @Published var paused = false {
+        didSet {
+            if paused { dismissFloatingAlerts(floatingAlerts) }
+        }
+    }
     @Published var dashboardPage = "all"
     @Published var windowObservation = false
     @Published var notifyInferred = false
@@ -20,6 +37,12 @@ final class MonitorModel: NSObject, ObservableObject, UNUserNotificationCenterDe
     @Published var recentNotices: [String] = []
     @Published var demo = false
     @Published var stateSince: [String: Date] = [:]
+    /// Observed running time of turns that just ended, keyed by session ID.
+    @Published private(set) var turnDurations: [String: TimeInterval] = [:]
+    @Published var completionChime = WatchPreferences.store.object(forKey: "completionChime") as? Bool ?? true {
+        didSet { WatchPreferences.store.set(completionChime, forKey: "completionChime") }
+    }
+    @Published private(set) var floatingAlerts = Set<FloatingAlertKey>()
     @Published private var completions = CompletionInbox()
     private var store = SessionStore()
     private let collector: MonitorCollector
@@ -31,8 +54,8 @@ final class MonitorModel: NSObject, ObservableObject, UNUserNotificationCenterDe
     private let metadataSources = MetadataSources()
     private var geminiTask: Task<Void, Never>?
     private let geminiCollector = GeminiCollector()
-    private let floatingPanel = FloatingPanelController()
     private var demoTurn = UUID().uuidString
+    private var lastChime = Date.distantPast
     private var engineCache = SnapshotFileCache()
     private var completionCache = SnapshotFileCache()
 
@@ -57,7 +80,8 @@ final class MonitorModel: NSObject, ObservableObject, UNUserNotificationCenterDe
                     evidence: evidence, updatedAt: now.addingTimeInterval(-elapsed), source: "synthetic_preview",
                     parentSessionID: nil, stale: false)
             }
-            runningApps = ["claude", "codex", "dsh", "antigravity", "gemini"]
+            runningBundleIDs = ["com.anthropic.claudefordesktop", "com.openai.codex", "com.deepseek.dsh",
+                                "com.google.antigravity", "com.google.GeminiMacOS"]
             completions.record(appID: "antigravity", sessionID: "complete-session", turnID: "preview-turn")
             demo = true
             lastScan = now
@@ -98,6 +122,7 @@ final class MonitorModel: NSObject, ObservableObject, UNUserNotificationCenterDe
         task = Task { [weak self] in
             while !Task.isCancelled {
                 guard let self else { return }
+                self.refreshRunningApps()
                 if !self.paused { await self.scan() }
                 do { try await Task.sleep(for: .seconds(1)) } catch { return }
             }
@@ -159,6 +184,9 @@ final class MonitorModel: NSObject, ObservableObject, UNUserNotificationCenterDe
     var activeCount: Int { sessions.filter { $0.state == .running && !$0.stale }.count }
     var completionCount: Int { completions.count }
     var barText: String { statusBarText(sessions: sessions, unreadCompletions: completions.count, paused: paused) }
+    var runningApps: Set<String> {
+        Set(liveApps.filter { $0.bundleIDs.contains(where: runningBundleIDs.contains) }.map(\.id))
+    }
 
     func recordsHealth(for appID: String) -> String? {
         if appID == "claude" {
@@ -186,17 +214,30 @@ final class MonitorModel: NSObject, ObservableObject, UNUserNotificationCenterDe
 
     func markCompletionsRead() {
         completions.markAllRead()
+        floatingAlerts = floatingAlerts.filter { $0.state != .responseEnded }
         _ = persistSnapshot()
     }
 
-    func showFloatingPanel() { floatingPanel.show(monitor: self) }
+    func dismissFloatingAlerts(_ displayed: Set<FloatingAlertKey>) {
+        if !floatingAlerts.isDisjoint(with: displayed) { floatingAlerts.subtract(displayed) }
+    }
+
+    private func refreshRunningApps() {
+        let observed = NSWorkspace.shared.runningApplications.filter { !$0.isTerminated }.compactMap(\.bundleIdentifier)
+        let opened = Set(liveApps.flatMap(\.bundleIDs)).intersection(observed)
+        guard opened != runningBundleIDs else { return }
+        let closed = runningBundleIDs.subtracting(opened)
+        runningBundleIDs = opened
+        if !closed.isEmpty && !floatingAlerts.isEmpty {
+            let ended = sessions.compactMap { session -> FloatingAlertKey? in
+                guard let bundleID = desktopBundleID(for: session), closed.contains(bundleID) else { return nil }
+                return FloatingAlertKey(session)
+            }
+            floatingAlerts.subtract(ended)
+        }
+    }
 
     func scan() async {
-        let observed = NSWorkspace.shared.runningApplications.compactMap(\.bundleIdentifier)
-        runningApps = Set(liveApps.filter { app in
-            let identities = app.id == "doubao" ? Array(app.bundleIDs.prefix(1)) : app.bundleIDs
-            return !identities.filter(observed.contains).isEmpty
-        }.map(\.id))
         let batch = await collector.collect(windowsEnabled: false)
         guard !paused else { return }
         diagnostics["events"] = batch.diagnostics["events"]
@@ -212,13 +253,20 @@ final class MonitorModel: NSObject, ObservableObject, UNUserNotificationCenterDe
 
     private func ingest(_ events: [MonitorEvent]) {
         let now = Date()
+        var alerts = floatingAlerts
         for event in events {
             if let notice = store.apply(event, now: now) {
                 if notice.state == .responseEnded && shouldRecordCompletion(notice, source: event.source) {
                     completions.record(appID: notice.appID, sessionID: notice.sessionID, turnID: event.turnID)
                 }
-                if now.timeIntervalSince(event.observedAt) <= 30 {
-                    deliver(notice, turnID: event.turnID, source: event.source)
+                if now.timeIntervalSince(event.observedAt) <= 30,
+                   allowsNotice(appID: notice.appID, state: notice.state, evidence: notice.evidence, source: event.source) {
+                    if notice.state == .waitingApproval || notice.state == .responseEnded {
+                        alerts.insert(FloatingAlertKey(appID: event.appID, sessionID: event.sessionID,
+                                                       turnID: event.turnID, state: notice.state))
+                    }
+                    let snapshot = store.sessions.first { $0.appID == notice.appID && $0.sessionID == notice.sessionID }
+                    deliver(notice, bundleID: snapshot.flatMap(desktopBundleID(for:)))
                 }
             }
         }
@@ -226,6 +274,15 @@ final class MonitorModel: NSObject, ObservableObject, UNUserNotificationCenterDe
         let before = Dictionary(uniqueKeysWithValues: sessions.map { ($0.id, $0) })
         sessions = store.sessions.filter { !($0.isWindowObservation && $0.stale) }
         demo = sessions.contains { $0.appID == "demo" }
+        var durations = turnDurations
+        for session in sessions where session.state == .responseEnded {
+            guard let previous = before[session.id], previous.state == .running,
+                  previous.turnID == session.turnID, let start = stateSince[session.id] else { continue }
+            durations[session.id] = max(0, session.updatedAt.timeIntervalSince(start))
+        }
+        let endedIDs = Set(sessions.filter { $0.state == .responseEnded }.map(\.id))
+        durations = durations.filter { endedIDs.contains($0.key) }
+        if durations != turnDurations { turnDurations = durations }
         for session in sessions {
             if stateSince[session.id] == nil || before[session.id]?.state != session.state || before[session.id]?.turnID != session.turnID {
                 stateSince[session.id] = min(session.updatedAt, now)
@@ -233,13 +290,39 @@ final class MonitorModel: NSObject, ObservableObject, UNUserNotificationCenterDe
         }
         let activeIDs = Set(sessions.map(\.id))
         stateSince = stateSince.filter { activeIDs.contains($0.key) }
+
+        let currentAlerts = sessions.filter { session in
+            !session.stale && (session.state == .waitingApproval || session.state == .responseEnded)
+                && allowsNotice(appID: session.appID, state: session.state, evidence: session.evidence, source: session.source)
+        }
+        if !notifyInferred {
+            for session in currentAlerts where session.state == .waitingApproval && now.timeIntervalSince(session.updatedAt) <= 30 {
+                let previous = before[session.id]
+                if previous?.state == .waitingApproval && previous?.evidence == .inferred && previous?.turnID == session.turnID {
+                    alerts.insert(FloatingAlertKey(session))
+                }
+            }
+        }
+        let activeAlerts = paused ? [] : alerts.intersection(currentAlerts.map(FloatingAlertKey.init))
+        if activeAlerts != floatingAlerts { floatingAlerts = activeAlerts }
     }
 
     private func shouldRecordCompletion(_ notice: MonitorNotice, source: String) -> Bool {
-        if notice.appID == "gemini" && notice.evidence == .inferred && source.hasPrefix("ax:gemini:") {
+        if isInferredGeminiWindow(appID: notice.appID, evidence: notice.evidence, source: source) {
             return notifyWindowCompletions
         }
         return true
+    }
+
+    private func allowsNotice(appID: String, state: SessionState, evidence: EvidenceKind, source: String) -> Bool {
+        if state == .responseEnded && isInferredGeminiWindow(appID: appID, evidence: evidence, source: source) {
+            return notifyWindowCompletions
+        }
+        return evidence == .explicit || notifyInferred
+    }
+
+    private func isInferredGeminiWindow(appID: String, evidence: EvidenceKind, source: String) -> Bool {
+        appID == "gemini" && evidence == .inferred && source.hasPrefix("ax:gemini:")
     }
 
     func grantAccessibility() {
@@ -267,13 +350,22 @@ final class MonitorModel: NSObject, ObservableObject, UNUserNotificationCenterDe
         NSWorkspace.shared.openApplication(at: url, configuration: NSWorkspace.OpenConfiguration())
     }
 
+    func openRunningApp(bundleID: String) {
+        guard let app = NSRunningApplication.runningApplications(withBundleIdentifier: bundleID).first(where: { !$0.isTerminated }),
+              let url = app.bundleURL else { return }
+        // Bring the agent's windows forward right away; opening through Launch Services
+        // also unhides the app when the direct activation is not honored.
+        app.unhide()
+        app.activate(options: [.activateAllWindows])
+        NSWorkspace.shared.openApplication(at: url, configuration: NSWorkspace.OpenConfiguration())
+    }
+
     func setDemo(_ state: SessionState) {
         demo = true
         if state == .running { demoTurn = UUID().uuidString }
         let event = MonitorEvent(id: UUID().uuidString, appID: "demo", sessionID: "demo-session", turnID: demoTurn,
             state: state, evidence: .explicit, observedAt: Date(), source: "demo_only")
-        if let notice = store.apply(event) { deliver(notice, turnID: event.turnID) }
-        sessions = store.sessions
+        ingest([event])
         _ = persistSnapshot()
     }
 
@@ -291,21 +383,22 @@ final class MonitorModel: NSObject, ObservableObject, UNUserNotificationCenterDe
         sessions = store.sessions
         demo = false
         completions.remove(appID: "demo")
+        floatingAlerts = floatingAlerts.filter { $0.appID != "demo" }
         recentNotices.removeAll { $0.hasPrefix("演示会话") }
         _ = persistSnapshot()
     }
 
-    private func deliver(_ notice: MonitorNotice, turnID: String, source: String = "") {
-        if notice.state == .responseEnded && !shouldRecordCompletion(notice, source: source) { return }
-        let verifiedWindowEnd = notifyWindowCompletions && notice.appID == "gemini"
-            && notice.state == .responseEnded && source.hasPrefix("ax:gemini:")
-        if notice.evidence == .inferred && !notifyInferred && !verifiedWindowEnd { return }
-        if notice.state == .responseEnded && shouldRecordCompletion(notice, source: source) {
-            completions.record(appID: notice.appID, sessionID: notice.sessionID, turnID: turnID)
-        }
+    private func deliver(_ notice: MonitorNotice, bundleID: String?) {
+        let iconFile = notice.state == .waitingApproval ? notificationIcon(appID: notice.appID, bundleID: bundleID) : nil
         let message = appName(notice.appID) + " · " + notice.state.label + (notice.evidence == .inferred ? "（推断）" : "")
         recentNotices.insert(message, at: 0)
         recentNotices = Array(recentNotices.prefix(20))
+        // The chime replaces the system notification sound for completions so it plays once.
+        let chimes = notice.state == .responseEnded && completionChime
+        if chimes && Date().timeIntervalSince(lastChime) > 1 {
+            lastChime = Date()
+            NSSound(named: "Glass")?.play()
+        }
         Task { [weak self] in
             guard let self else { return }
             let center = UNUserNotificationCenter.current()
@@ -318,10 +411,16 @@ final class MonitorModel: NSObject, ObservableObject, UNUserNotificationCenterDe
                 return
             }
             let content = UNMutableNotificationContent()
-            content.title = "Agent Watch"
-            content.body = message
-            content.sound = .default
-            content.userInfo = ["appID": notice.appID]
+            // The agent leads the title so a glance tells which one needs attention.
+            content.title = appName(notice.appID)
+            content.subtitle = notice.state.label + (notice.evidence == .inferred ? "（推断）" : "")
+            content.body = notice.state == .waitingApproval ? "点按切换到该应用进行授权" : "点按切换到该应用"
+            content.sound = chimes ? nil : .default
+            content.threadIdentifier = notice.appID
+            content.userInfo = ["appID": notice.appID, "bundleID": bundleID ?? ""]
+            if let iconFile, let attachment = try? UNNotificationAttachment(identifier: "agent-icon", url: iconFile) {
+                content.attachments = [attachment]
+            }
             let request = UNNotificationRequest(identifier: UUID().uuidString, content: content, trigger: nil)
             do {
                 try await center.add(request)
@@ -342,9 +441,22 @@ final class MonitorModel: NSObject, ObservableObject, UNUserNotificationCenterDe
         }
     }
 
+    /// Writes the agent's icon to a temporary PNG; the notification store takes ownership of the file.
+    private func notificationIcon(appID: String, bundleID: String?) -> URL? {
+        guard let icon = AppIconCache.icon(appID: appID, bundleID: bundleID),
+              let tiff = icon.tiffRepresentation, let bitmap = NSBitmapImageRep(data: tiff),
+              let png = bitmap.representation(using: .png, properties: [:]) else { return nil }
+        let url = FileManager.default.temporaryDirectory.appendingPathComponent("agent-watch-\(UUID().uuidString).png")
+        return (try? png.write(to: url, options: .atomic)) != nil ? url : nil
+    }
+
     nonisolated func userNotificationCenter(_ center: UNUserNotificationCenter, didReceive response: UNNotificationResponse) async {
-        guard let appID = response.notification.request.content.userInfo["appID"] as? String else { return }
-        await openApp(appID)
+        let info = response.notification.request.content.userInfo
+        if let bundleID = info["bundleID"] as? String, !bundleID.isEmpty {
+            await openRunningApp(bundleID: bundleID)
+        } else if let appID = info["appID"] as? String {
+            await openApp(appID)
+        }
     }
 
     private struct Export: Encodable {

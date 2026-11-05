@@ -5,7 +5,7 @@ import AgentWatchCore
 @main
 struct AgentWatchMonitorApp: App {
     @StateObject private var monitor = MonitorModel(preview: CommandLine.arguments.contains("--render-previews"))
-    @AppStorage("appearance", store: WatchPreferences.store) private var appearance = "system"
+    @NSApplicationDelegateAdaptor(MenuBarController.self) private var menuBar
 
     init() {
         if let index = CommandLine.arguments.firstIndex(of: "--render-previews"),
@@ -20,16 +20,28 @@ struct AgentWatchMonitorApp: App {
 
     var body: some Scene {
         WindowGroup("Agent Watch", id: "dashboard") {
-            MonitorDashboard(monitor: monitor)
-                .preferredColorScheme(appearance == "light" ? .light : appearance == "dark" ? .dark : nil)
+            DashboardScene(monitor: monitor, menuBar: menuBar)
         }.defaultSize(width: 1080, height: 760)
         .commands { WatchCommands(monitor: monitor) }
-        MenuBarExtra {
-            MenuPanel(monitor: monitor)
-        } label: {
-            Label(monitor.barText, systemImage: monitor.paused ? "pause.circle" : monitor.attentionCount > 0 ? "bell.badge.fill" : monitor.completionCount > 0 ? "checkmark.circle.fill" : monitor.activeCount > 0 ? "waveform.path" : "binoculars")
-                .help("Agent Watch · " + monitor.barText)
-        }.menuBarExtraStyle(.window)
+    }
+}
+
+private struct DashboardScene: View {
+    @ObservedObject var monitor: MonitorModel
+    let menuBar: MenuBarController
+    @Environment(\.openWindow) private var openWindow
+    @AppStorage("appearance", store: WatchPreferences.store) private var appearance = "system"
+
+    var body: some View {
+        MonitorDashboard(monitor: monitor)
+            .preferredColorScheme(watchColorScheme(for: appearance))
+            .onAppear {
+                guard !CommandLine.arguments.contains("--render-previews") else { return }
+                menuBar.install(monitor: monitor) { [openWindow] in
+                    openWindow(id: "dashboard")
+                    NSApp.activate(ignoringOtherApps: true)
+                }
+            }
     }
 }
 

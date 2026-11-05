@@ -12,15 +12,93 @@ enum WatchTheme {
     })
     static let surface = Color(nsColor: .textBackgroundColor)
     static let border = Color(nsColor: .separatorColor).opacity(0.48)
+    /// Brand color for primary controls; the agents' own icons supply the color.
+    static let ink = Color(nsColor: NSColor(name: NSColor.Name("AgentWatchInk")) { appearance in
+        if appearance.bestMatch(from: [.aqua, .darkAqua]) == .darkAqua {
+            return NSColor(srgbRed: 0.93, green: 0.93, blue: 0.95, alpha: 1)
+        }
+        return NSColor(srgbRed: 0.11, green: 0.12, blue: 0.14, alpha: 1)
+    })
+    static let selection = Color.primary.opacity(0.07)
+    static let sidebar = Color(nsColor: .windowBackgroundColor)
+}
+
+/// Icons of the monitored applications, read from the local installation.
+@MainActor
+enum AppIconCache {
+    private static var icons: [String: NSImage?] = [:]
+
+    static func icon(appID: String, bundleID: String?) -> NSImage? {
+        let bundleIDs = bundleID.map { [$0] } ?? liveApps.first { $0.contains(appID) }?.bundleIDs ?? []
+        guard !bundleIDs.isEmpty else { return nil }
+        let key = bundleIDs.joined(separator: ",")
+        if let cached = icons[key] { return cached }
+        let icon = bundleIDs.lazy.compactMap { id -> NSImage? in
+            if let running = NSRunningApplication.runningApplications(withBundleIdentifier: id)
+                .first(where: { !$0.isTerminated }), let icon = running.icon { return icon }
+            return NSWorkspace.shared.urlForApplication(withBundleIdentifier: id)
+                .map { NSWorkspace.shared.icon(forFile: $0.path) }
+        }.first
+        icons.updateValue(icon, forKey: key)
+        return icon
+    }
+}
+
+/// The Agent Watch mark: the camera housing with a status strip below it.
+struct BrandMark: View {
+    var size: CGFloat = 34
+
+    var body: some View {
+        let unit = size / 100
+        // Same geometry as scripts/make-icon.swift, in a 100-unit tile.
+        let tile = RoundedRectangle(cornerRadius: 22.5 * unit, style: .continuous)
+        ZStack(alignment: .top) {
+            tile.fill(LinearGradient(colors: [Color(red: 0.2, green: 0.21, blue: 0.25), Color(red: 0.07, green: 0.075, blue: 0.09)],
+                                     startPoint: .top, endPoint: .bottom))
+            UnevenRoundedRectangle(bottomLeadingRadius: 6.3 * unit, bottomTrailingRadius: 6.3 * unit, style: .continuous)
+                .fill(Color.black)
+                .frame(width: 39 * unit, height: 13.6 * unit)
+            Capsule()
+                .fill(Color(red: 0.03, green: 0.035, blue: 0.045))
+                .overlay { Capsule().strokeBorder(Color.white.opacity(0.1), lineWidth: max(0.5, 0.5 * unit)) }
+                .frame(width: 78 * unit, height: 28 * unit)
+                .overlay {
+                    HStack(spacing: 6.6 * unit) {
+                        ForEach([SessionState.running, .waitingApproval, .responseEnded], id: \.self) { state in
+                            Circle().fill(state.uiColor).frame(width: 15 * unit, height: 15 * unit)
+                        }
+                    }
+                }
+                .offset(y: 27 * unit)
+        }
+        .frame(width: size, height: size)
+        .clipShape(tile)
+        .accessibilityHidden(true)
+    }
+}
+
+struct InkButtonStyle: ButtonStyle {
+    func makeBody(configuration: Configuration) -> some View {
+        configuration.label
+            .font(.system(size: 12, weight: .semibold))
+            .foregroundStyle(WatchTheme.canvas)
+            .padding(.horizontal, 12)
+            .frame(height: 30)
+            .background(WatchTheme.ink.opacity(configuration.isPressed ? 0.78 : 1),
+                        in: RoundedRectangle(cornerRadius: 8, style: .continuous))
+            .contentShape(Rectangle())
+    }
 }
 
 struct AppBadge: View {
     let appID: String
     var size: CGFloat = 32
+    var bundleID: String?
 
-    init(appID: String, size: CGFloat = 32) {
+    init(appID: String, size: CGFloat = 32, bundleID: String? = nil) {
         self.appID = appID
         self.size = size
+        self.bundleID = bundleID
     }
 
     private var symbol: String {
@@ -53,12 +131,24 @@ struct AppBadge: View {
     }
 
     var body: some View {
-        ZStack {
-            RoundedRectangle(cornerRadius: size * 0.28, style: .continuous)
-                .fill(tint.opacity(0.13))
-            Image(systemName: symbol)
-                .font(.system(size: size * 0.46, weight: .semibold))
-                .foregroundStyle(tint)
+        Group {
+            if let icon = AppIconCache.icon(appID: appID, bundleID: bundleID) {
+                Image(nsImage: icon)
+                    .renderingMode(.original)
+                    .resizable()
+                    .interpolation(.high)
+                    .scaledToFit()
+            } else {
+                // Symbol fallback when the application is not installed.
+                ZStack {
+                    RoundedRectangle(cornerRadius: size * 0.24, style: .continuous)
+                        .fill(tint.opacity(0.13))
+                    Image(systemName: symbol)
+                        .font(.system(size: size * 0.46, weight: .semibold))
+                        .foregroundStyle(tint)
+                }
+                .padding(size * 0.06)
+            }
         }
         .frame(width: size, height: size)
         .accessibilityLabel(appName(appID))
@@ -106,25 +196,25 @@ struct MetricTile: View {
     }
 
     var body: some View {
-        HStack(spacing: 8) {
-            Image(systemName: symbol)
-                .font(.system(size: 14, weight: .semibold))
-                .foregroundStyle(color)
-                .frame(width: 26, height: 26)
-                .background(color.opacity(0.11), in: RoundedRectangle(cornerRadius: 8, style: .continuous))
-            VStack(alignment: .leading, spacing: 2) {
-                Text("\(value)")
-                    .font(.system(.headline, design: .rounded).weight(.semibold))
-                    .contentTransition(.numericText())
+        VStack(alignment: .leading, spacing: 3) {
+            HStack(spacing: 5) {
+                Image(systemName: symbol)
+                    .font(.system(size: 7, weight: .semibold))
+                    .foregroundStyle(color)
                 Text(title)
-                    .font(.caption2)
+                    .font(.caption2.weight(.medium))
                     .foregroundStyle(.secondary)
                     .lineLimit(1)
                     .minimumScaleFactor(0.8)
             }
-            Spacer(minLength: 0)
+            Text("\(value)")
+                .font(.system(size: 22, weight: .semibold, design: .rounded))
+                .monospacedDigit()
+                .foregroundStyle(value > 0 ? AnyShapeStyle(.primary) : AnyShapeStyle(.tertiary))
+                .contentTransition(.numericText())
         }
-        .padding(9)
+        .padding(.horizontal, 11)
+        .padding(.vertical, 9)
         .frame(maxWidth: .infinity, alignment: .leading)
         .background(WatchTheme.surface, in: RoundedRectangle(cornerRadius: 12, style: .continuous))
         .overlay {
@@ -139,7 +229,7 @@ extension SessionState {
     var uiColor: Color {
         switch self {
         case .unknown: return .secondary
-        case .running: return Color(red: 0.25, green: 0.59, blue: 0.43)
+        case .running: return Color(red: 0.24, green: 0.52, blue: 0.91)
         case .waitingApproval, .waitingInput: return WatchTheme.accent
         case .responseEnded: return Color(red: 0.25, green: 0.59, blue: 0.43)
         case .failed: return .red
@@ -158,6 +248,40 @@ extension SessionState {
         case .cancelled: return "slash.circle.fill"
         }
     }
+}
+
+/// A dot that emits a soft ring while its state is live.
+struct PulsingDot: View {
+    let color: Color
+    var size: CGFloat = 7
+    var pulsing = true
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    @State private var expanded = false
+
+    var body: some View {
+        Circle()
+            .fill(color)
+            .frame(width: size, height: size)
+            .background {
+                if pulsing && !reduceMotion && !WatchPreferences.rendersPreviews {
+                    Circle()
+                        .fill(color.opacity(0.45))
+                        .scaleEffect(expanded ? 2.6 : 1)
+                        .opacity(expanded ? 0 : 1)
+                        .onAppear {
+                            withAnimation(.easeOut(duration: 1.5).repeatForever(autoreverses: false)) { expanded = true }
+                        }
+                }
+            }
+            .accessibilityHidden(true)
+    }
+}
+
+func turnDurationText(_ interval: TimeInterval) -> String {
+    let seconds = max(1, Int(interval.rounded()))
+    if seconds < 60 { return "\(seconds) 秒" }
+    if seconds < 3600 { return "\(seconds / 60) 分 \(seconds % 60) 秒" }
+    return "\(seconds / 3600) 小时 \(seconds % 3600 / 60) 分"
 }
 
 func watchColorScheme(for appearance: String) -> ColorScheme? {

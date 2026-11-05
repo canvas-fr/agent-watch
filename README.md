@@ -1,8 +1,8 @@
 # Agent Watch
 
-[English](README.en.md) · [界面预览](docs/INTERFACE.zh-CN.md) · [安装说明](docs/INSTALLATION.md) · [发布说明](docs/RELEASE-NOTES-0.4.0-preview.8.md)
+[English](README.en.md) · [界面预览](docs/INTERFACE.zh-CN.md) · [安装说明](docs/INSTALLATION.md) · [发布说明](docs/RELEASE-NOTES-0.4.0-preview.9.md)
 
-本地运行的 macOS 智能体监控器。当前源码版本为 **0.4.0 Preview（Build 8）**：包含持续采集、会话状态、动态菜单栏、可贴边悬浮面板、系统通知、状态导出和打开原应用入口。本版本为预览版；各客户端的验收状态和限制见下表。
+本地运行的 macOS 智能体监控器。当前源码版本为 **0.4.0 Preview（Build 9）**，包含持续采集、会话状态、动态菜单栏、悬停状态条、系统通知、状态导出和打开原应用入口。各客户端的验收状态和限制见下表。
 
 **当前版移除豆包，冻结新接入。Gemini 与 Devin 为实验项，尚未全部通过真实任务验收。** 实验窗口观察默认关闭。“已安装适配器”“窗口可访问”和“实际识别任务状态”分别记录，不把候选规则当成已验证兼容。
 
@@ -11,7 +11,9 @@
 - 统一的运行、等待授权、等待回答、本轮结束、失败、取消和未知状态。
 - 按应用/会话/轮次隔离，子任务单独展示；去重、乱序与终态回滚保护。
 - 过期的进行中状态转为未知；确认过的结束结果保留为历史记录。未读结束标记持久化，直到手动标记已读。
-- 状态栏动态显示运行、待处理、新结束；展开后列出近期会话、持续时间和打开应用入口。悬浮小面板可固定在屏幕边缘。
+- 状态栏动态显示运行、待处理和新结束。指针停在屏幕刘海或下沿时，横向状态条显示当前已打开的受支持应用及其运行信号。点击状态条里的应用图标可切回该应用。无刘海的屏幕可悬停 Agent Watch 菜单栏图标。
+- 收到已打开应用的新授权请求或本轮结束信号时，状态条会主动弹出。指针在刘海或状态条内时保持显示，移开约 3 秒后收起。授权提醒会一直显示，直到授权完成或点叉收起；卡片标明是哪个智能体、已等待多久，点按即切换到该应用。
+- 本轮结束提醒从刘海下方弹入，显示观察到的本轮用时，并播放可在设置中关闭的完成提示音。有未读结束时菜单栏图标变为绿色；有智能体等待处理时，菜单栏显示该智能体的图标并带橙色圆点。
 - 各应用独立观察：窗口路径匹配受限控件和固定状态词，输入值、聊天内容和窗口标题不进入历史记录；推断单独标注。窗口内不可见的其他会话不保证覆盖；停止按钮消失不能证明正常完成。
 - Codex 本地生命周期日志、Claude Code 成功计数与准确轮次映射、Claude 本地 Chat/Cowork 审计读取器；另有 WorkBuddy 事件桥、DSH 插件、Antigravity 和 Devin 接入。
 - 旧版 Codex/Claude Code Stop 及 Devin 早到回调仅作为待确认信号；升级时精确迁移这些来源的旧误判。
@@ -78,7 +80,7 @@ Antigravity 的安装与范围见 [ANTIGRAVITY.md](adapters/ANTIGRAVITY.md)，�
 
 ## English
 
-Agent Watch is a local-first macOS agent monitor. The source version is 0.4.0 Preview (Build 8), with a dynamic menu bar, an edge panel, a persistent state machine, metadata-only lifecycle readers, conservative window inference, notifications, and local status export.
+Agent Watch is a local-first macOS agent monitor. The source version is 0.4.0 Preview (Build 9), with a dynamic menu bar, an edge panel, a persistent state machine, metadata-only lifecycle readers, conservative window inference, notifications, and local status export.
 
 **Doubao is out of scope for this preview; new integrations are frozen. Gemini and Devin remain experimental.** Claude Code and API Cowork have live lifecycle evidence on 4.4212.0 using Sonnet Low. Codex now confirms completion from its lifecycle journal; Stop hooks alone are not completion evidence. DSH and WorkBuddy have earlier live activity/turn-end receipts. Antigravity 2.28.2 also passed a real question-and-answer lifecycle, while its native cancellation callback was not observed. Other integrations are explicitly marked as installed, fixture-tested, inferred, blocked, or unverified in the matrix above. CLI support never implies desktop support. Hidden conversations are not guaranteed by window observation.
 
