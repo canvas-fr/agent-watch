@@ -2,6 +2,10 @@
 
 Release history for Agent Watch. This project is currently distributed as a preview; the acceptance status and limits for each integration remain in the README and acceptance matrix.
 
+## 0.4.0 Preview — Build 9
+
+See [release notes](RELEASE-NOTES-0.4.0-preview.9.md).
+
 ## 0.4.0 Preview — Build 8
 
 See [release notes](RELEASE-NOTES-0.4.0-preview.8.md).

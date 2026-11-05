@@ -2,9 +2,11 @@
 
 [中文说明](README.md) · [Interface](docs/INTERFACE.zh-CN.md) · [Installation](docs/INSTALLATION.md) · [Release packaging](docs/RELEASING.md)
 
-A local macOS monitor for desktop AI agents. **0.4.0 Preview, build 8**, targets Apple silicon and macOS 14+. Python 3 is required separately for local-record adapters and event bridges.
+A local macOS monitor for desktop AI agents. **0.4.0 Preview, build 9**, targets Apple silicon and macOS 14+. Python 3 is required separately for local-record adapters and event bridges.
 
-Agent Watch shows running sessions, permission requests, questions, ended turns, failures, cancellations, and unknown states in a dashboard, dynamic menu bar item, and floating panel. Notifications are deduplicated. An ended reply does not establish that the user's entire goal is complete. Opening a row currently activates its app, without selecting the exact chat.
+Agent Watch shows session activity and results in the dashboard and menu bar details. Move the pointer to the camera housing or just below it to see a compact status strip for supported apps that are open. On a display without a camera housing, hover over the Agent Watch menu bar item. Click the item for recent sessions. Notifications are deduplicated, and each completion describes a single turn. Opening a session row activates its app.
+
+A new approval request or ended turn from an open app brings up the strip. Click an app icon to switch to that app. The strip stays open while the pointer is over it or the camera housing and closes about three seconds after the pointer leaves. An approval notice stays until the request is handled or dismissed; it names the waiting agent, shows how long it has waited, and switches to that app when clicked.
 
 The interface uses a sidebar, session cards, filters, search, an integration status page, and settings. Appearance follows the system or can be fixed to light/dark. UI screenshots in this repository use synthetic data.
 

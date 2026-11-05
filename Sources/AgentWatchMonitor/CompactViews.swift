@@ -4,7 +4,7 @@ import AgentWatchCore
 
 struct MenuPanel: View {
     @ObservedObject var monitor: MonitorModel
-    @Environment(\.openWindow) private var openWindow
+    let openDashboard: () -> Void
     @AppStorage("appearance", store: WatchPreferences.store) private var appearance = "system"
 
     private var recentSessions: [SessionSnapshot] {
@@ -20,11 +20,7 @@ struct MenuPanel: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
             HStack(spacing: 10) {
-                Image(systemName: "binoculars.fill")
-                    .font(.system(size: 17, weight: .semibold))
-                    .foregroundStyle(WatchTheme.accent)
-                    .frame(width: 34, height: 34)
-                    .background(WatchTheme.accent.opacity(0.12), in: RoundedRectangle(cornerRadius: 10, style: .continuous))
+                BrandMark(size: 34)
                 VStack(alignment: .leading, spacing: 2) {
                     Text("Agent Watch").font(.headline)
                     Text(monitor.paused ? "监控已暂停 · 保留最近结果" : "实时会话概览")
@@ -40,9 +36,10 @@ struct MenuPanel: View {
             }
 
             HStack(spacing: 8) {
-                MetricTile(title: "运行中", value: monitor.activeCount, symbol: "arrow.triangle.2.circlepath", color: .green)
-                MetricTile(title: "需处理", value: monitor.attentionCount, symbol: "exclamationmark.circle.fill", color: WatchTheme.accent)
-                MetricTile(title: "未读结束", value: monitor.completionCount, symbol: "checkmark.circle.fill", color: .blue)
+                MetricTile(title: "运行中", value: monitor.activeCount, symbol: "circle.fill", color: SessionState.running.uiColor)
+                MetricTile(title: "需处理", value: monitor.attentionCount, symbol: "circle.fill", color: WatchTheme.accent)
+                MetricTile(title: "未读结束", value: monitor.completionCount, symbol: "circle.fill",
+                           color: SessionState.responseEnded.uiColor)
             }
 
             HStack {
@@ -52,7 +49,7 @@ struct MenuPanel: View {
                     Button("全部已读") { monitor.markCompletionsRead() }
                         .font(.caption.weight(.medium))
                         .buttonStyle(.borderless)
-                        .foregroundStyle(WatchTheme.accent)
+                        .foregroundStyle(.secondary)
                 }
             }
 
@@ -74,33 +71,25 @@ struct MenuPanel: View {
             }
             .frame(minHeight: 100, maxHeight: 310)
 
-            Button {
-                openWindow(id: "dashboard")
-                NSApp.activate(ignoringOtherApps: true)
-            } label: {
-                Label("打开监控面板", systemImage: "rectangle.3.group.fill")
-                    .frame(maxWidth: .infinity, alignment: .leading)
-            }
-            .buttonStyle(.borderedProminent)
-            .tint(WatchTheme.accent)
-
             HStack(spacing: 8) {
-                Button {
-                    monitor.showFloatingPanel()
-                } label: {
-                    Label("悬浮面板", systemImage: "macwindow")
+                Button(action: openDashboard) {
+                    Label("打开监控面板", systemImage: "macwindow")
                         .frame(maxWidth: .infinity)
                 }
-                .buttonStyle(.bordered)
+                .buttonStyle(InkButtonStyle())
 
                 Button {
                     monitor.paused.toggle()
                 } label: {
-                    Label(monitor.paused ? "继续监控" : "暂停监控",
-                          systemImage: monitor.paused ? "play.fill" : "pause.fill")
-                        .frame(maxWidth: .infinity)
+                    Image(systemName: monitor.paused ? "play.fill" : "pause.fill")
+                        .font(.system(size: 12, weight: .semibold))
+                        .frame(width: 34, height: 30)
+                        .background(WatchTheme.selection, in: RoundedRectangle(cornerRadius: 8, style: .continuous))
+                        .contentShape(Rectangle())
                 }
-                .buttonStyle(.bordered)
+                .buttonStyle(.plain)
+                .help(monitor.paused ? "继续监控" : "暂停监控")
+                .accessibilityLabel(monitor.paused ? "继续监控" : "暂停监控")
             }
 
             Button(role: .destructive) {
@@ -131,6 +120,8 @@ struct CompactSessionCard: View {
     private var historicalTerminal: Bool {
         session.stale && [.responseEnded, .failed, .cancelled].contains(session.state)
     }
+
+    private var showsStripe: Bool { !session.stale && session.state != .unknown }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 7) {
@@ -179,10 +170,17 @@ struct CompactSessionCard: View {
             .font(.caption2)
         }
         .padding(10)
+        .padding(.leading, showsStripe ? 3 : 0)
         .background(WatchTheme.surface, in: RoundedRectangle(cornerRadius: 12, style: .continuous))
+        .overlay(alignment: .leading) {
+            if showsStripe {
+                Capsule().fill(session.state.uiColor).frame(width: 3).padding(.vertical, 12).padding(.leading, 5)
+            }
+        }
         .overlay {
             RoundedRectangle(cornerRadius: 12, style: .continuous)
-                .stroke(WatchTheme.border, lineWidth: 1)
+                .stroke(!session.stale && session.state.needsAttention ? WatchTheme.accent.opacity(0.4) : WatchTheme.border,
+                        lineWidth: 1)
         }
         .accessibilityElement(children: .contain)
     }

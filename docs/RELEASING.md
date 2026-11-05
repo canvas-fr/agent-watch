@@ -1,12 +1,12 @@
 # Release packaging
 
-The current release candidate is **0.4.0 Preview, build 8**, for arm64 Macs on macOS 14 or later. The release script packages a clean, committed checkout into a DMG, an app ZIP, a source ZIP, SHA-256 checksums, a JSON manifest, and release notes. It does not publish artifacts to a server.
+The current release candidate is **0.4.0 Preview, build 9**, for arm64 Macs on macOS 14 or later. The release script packages a clean, committed checkout into a DMG, an app ZIP, a source ZIP, SHA-256 checksums, a JSON manifest, and release notes. It does not publish artifacts to a server.
 
 ## Prepare the source
 
 Commit the exact source that should ship. The selected `--source-ref` must resolve to the checked-out `HEAD`, and the worktree must be clean, including untracked files. This keeps the app build and source archive tied to the same commit. The source archive is created with `git archive`; it contains no `.git` directory.
 
-Check that `docs/RELEASE-NOTES-0.4.0-preview.8.md` describes the final UI and scope. Confirm the README and acceptance matrix still describe the evidence accurately. The current scope excludes Doubao, treats Gemini and Devin as experimental, and leaves experimental window observation disabled by default.
+Check that `docs/RELEASE-NOTES-0.4.0-preview.9.md` describes the final UI and scope. Confirm the README and acceptance matrix still describe the evidence accurately. The current scope excludes Doubao, treats Gemini and Devin as experimental, and leaves experimental window observation disabled by default.
 
 ## Build an ad hoc candidate
 

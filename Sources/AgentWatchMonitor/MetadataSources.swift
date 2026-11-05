@@ -36,7 +36,7 @@ actor MetadataSources {
         ]
     }
 
-    private nonisolated static func pythonInterpreter() -> URL? {
+    nonisolated static func pythonInterpreter() -> URL? {
         let candidates = [
             "/opt/homebrew/bin/python3",
             "/usr/local/bin/python3",

@@ -62,8 +62,15 @@ struct InboxChecks {
         let claudeStop = MonitorEvent(id: "claude-stop-intent", appID: "claude_code",
             sessionID: "claude-session", turnID: "claude-turn", state: .responseEnded,
             evidence: .explicit, observedAt: now, source: "claude_code:Stop")
-        try expect(normalizeLifecycleEvidence(claudeStop).state == .unknown,
-                   "Claude Stop can also be blocked by a later hook")
+        let inferredClaudeEnd = normalizeLifecycleEvidence(claudeStop)
+        try expect(inferredClaudeEnd.state == .responseEnded && inferredClaudeEnd.evidence == .inferred
+                   && inferredClaudeEnd.source == claudeCodeInferredStopSource,
+                   "Claude Stop is only an inferred end because a later hook can block it")
+        let claudeSubagentStop = MonitorEvent(id: "claude-subagent-stop", appID: "claude_code",
+            sessionID: "claude-session", turnID: "claude-turn", state: .responseEnded,
+            evidence: .explicit, observedAt: now, source: "claude_code:SubagentStop")
+        try expect(normalizeLifecycleEvidence(claudeSubagentStop).state == .unknown,
+                   "a subagent Stop does not end the parent turn")
         let legacyPost = MonitorEvent(id: "devin-early-post", appID: "devin", sessionID: "devin-session",
             turnID: "devin-turn", state: .responseEnded, evidence: .explicit, observedAt: now,
             source: "devin:post_cascade_response")

@@ -26,6 +26,14 @@ func appName(_ id: String) -> String {
     return liveApps.first { $0.id == id }?.name ?? "未知应用"
 }
 
+func desktopBundleID(for session: SessionSnapshot) -> String? {
+    // The shared catalog ID covers ChatGPT window observations and Codex task records.
+    if session.appID == "codex" {
+        return session.isWindowObservation ? "com.openai.chat" : "com.openai.codex"
+    }
+    return liveApps.first { $0.contains(session.appID) }?.bundleIDs.first
+}
+
 extension SessionState {
     var label: String {
         switch self {
@@ -39,4 +47,6 @@ extension SessionState {
         }
     }
     var needsAttention: Bool { self == .waitingApproval || self == .waitingInput || self == .failed }
+    /// The agent is blocked until the user acts.
+    var isWaiting: Bool { self == .waitingApproval || self == .waitingInput }
 }

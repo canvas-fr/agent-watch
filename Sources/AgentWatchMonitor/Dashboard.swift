@@ -24,6 +24,7 @@ struct MonitorDashboard: View {
     @State private var filter = SessionFilter.all
     @State private var query = ""
     @State private var pinned = false
+    @State private var pendingHook: PendingHook?
     @AppStorage("appearance", store: WatchPreferences.store) private var appearance = "system"
 
     private var selectedApp: LiveApp? { liveApps.first { $0.id == selected } }
@@ -51,132 +52,146 @@ struct MonitorDashboard: View {
                 else { sessionPage }
                 footer
             }.background(WatchTheme.canvas)
-        }.tint(WatchTheme.accent).frame(minWidth: 860, minHeight: 600)
+        }.tint(WatchTheme.ink).frame(minWidth: 860, minHeight: 600)
     }
 
     private var sidebar: some View {
-        VStack(alignment: .leading, spacing: 20) {
+        VStack(alignment: .leading, spacing: 18) {
             HStack(spacing: 10) {
-                Image(systemName: "waveform.path.ecg").font(.system(size: 21, weight: .semibold))
-                    .foregroundStyle(.white).frame(width: 38, height: 38)
-                    .background(WatchTheme.accent.gradient, in: RoundedRectangle(cornerRadius: 11))
-                VStack(alignment: .leading, spacing: 3) {
-                    Text("Agent Watch").font(.system(size: 16, weight: .semibold))
+                BrandMark(size: 34)
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("Agent Watch").font(.system(size: 14, weight: .semibold))
                     Text("你的智能体，一眼掌握").font(.system(size: 10)).foregroundStyle(.secondary)
                 }
-            }.padding(.horizontal, 8).padding(.top, 10)
-            VStack(spacing: 5) {
-                navigationRow("全部会话", symbol: "square.grid.2x2", destination: "all", count: monitor.sessions.count)
+            }.padding(.horizontal, 6).padding(.top, 8)
+            VStack(spacing: 2) {
+                navigationRow("全部会话", symbol: "tray.full", destination: "all", count: monitor.sessions.count)
                 navigationRow("接入状态", symbol: "point.3.connected.trianglepath.dotted", destination: "integrations")
             }
             ScrollView {
-              VStack(alignment: .leading, spacing: 6) {
-                Text("监控应用").font(.system(size: 10, weight: .semibold)).foregroundStyle(.tertiary).padding(.horizontal, 12)
+              VStack(alignment: .leading, spacing: 2) {
+                Text("监控应用").font(.system(size: 10, weight: .semibold)).foregroundStyle(.tertiary)
+                    .padding(.horizontal, 10).padding(.bottom, 4)
                 ForEach(liveApps) { app in
                     Button { selected = app.id; filter = .all; query = "" } label: {
-                        HStack(spacing: 10) {
-                            AppBadge(appID: app.id, size: 26)
+                        HStack(spacing: 9) {
+                            AppBadge(appID: app.id, size: 24)
                             Text(app.name).font(.system(size: 12, weight: selected == app.id ? .semibold : .regular)).lineLimit(1)
                             Spacer(minLength: 2)
-                            if app.id == "gemini" || app.id == "devin" { Text("实验").font(.system(size: 9)).foregroundStyle(.secondary) }
-                            Circle().fill(monitor.runningApps.contains(app.id) ? Color.green : Color.secondary.opacity(0.25)).frame(width: 5, height: 5)
-                        }.padding(.horizontal, 10).padding(.vertical, 8)
-                            .background(selected == app.id ? WatchTheme.accent.opacity(0.10) : .clear, in: RoundedRectangle(cornerRadius: 8))
+                            if app.id == "gemini" || app.id == "devin" { ExperimentTag() }
+                            Circle().fill(monitor.runningApps.contains(app.id) ? SessionState.responseEnded.uiColor : Color.secondary.opacity(0.25))
+                                .frame(width: 6, height: 6)
+                                .help(monitor.runningApps.contains(app.id) ? "应用已打开" : "应用未运行")
+                        }.padding(.horizontal, 8).padding(.vertical, 6)
+                            .background(selected == app.id ? WatchTheme.selection : .clear, in: RoundedRectangle(cornerRadius: 7, style: .continuous))
                             .contentShape(Rectangle())
                     }.buttonStyle(.plain).help(app.capability)
                 }
               }
             }.scrollIndicators(.hidden)
-            VStack(spacing: 6) {
-                navigationRow("设置", symbol: "slider.horizontal.3", destination: "settings")
+            VStack(spacing: 8) {
+                navigationRow("设置", symbol: "gearshape", destination: "settings")
                 HStack(spacing: 6) {
-                    Circle().fill(monitor.paused ? Color.orange : Color.green).frame(width: 6, height: 6)
-                    Text(monitor.paused ? "监控已暂停" : "本地监控已启动").font(.system(size: 11)).foregroundStyle(.secondary)
+                    PulsingDot(color: monitor.paused ? .orange : SessionState.responseEnded.uiColor, size: 6, pulsing: !monitor.paused)
+                    Text(monitor.paused ? "监控已暂停" : "本地监控中").font(.system(size: 11)).foregroundStyle(.secondary)
                     Spacer()
                     Text("0.4.0").font(.system(size: 10, design: .monospaced)).foregroundStyle(.tertiary)
-                }.padding(.horizontal, 12).padding(.top, 8)
+                }.padding(.horizontal, 10)
             }
-        }.padding(14).frame(width: 224).background(Color(nsColor: .windowBackgroundColor))
+        }.padding(12).frame(width: 220).background(WatchTheme.sidebar)
     }
 
     private func navigationRow(_ name: String, symbol: String, destination: String, count: Int? = nil) -> some View {
         Button { selected = destination; filter = .all; query = "" } label: {
-            HStack(spacing: 10) {
-                Image(systemName: symbol).font(.system(size: 14)).frame(width: 26)
+            HStack(spacing: 9) {
+                Image(systemName: symbol).font(.system(size: 13, weight: .medium)).frame(width: 24)
+                    .foregroundStyle(selected == destination ? Color.primary : .secondary)
                 Text(name).font(.system(size: 12, weight: selected == destination ? .semibold : .regular))
                 Spacer()
-                if let count { Text("\(count)").font(.system(size: 10, weight: .medium, design: .monospaced)).foregroundStyle(.secondary) }
-            }.padding(.horizontal, 10).padding(.vertical, 10)
-                .foregroundStyle(selected == destination ? WatchTheme.accent : Color.primary)
-                .background(selected == destination ? WatchTheme.accent.opacity(0.10) : .clear, in: RoundedRectangle(cornerRadius: 8))
+                if let count { Text("\(count)").font(.system(size: 10, weight: .medium)).monospacedDigit().foregroundStyle(.secondary) }
+            }.padding(.horizontal, 8).padding(.vertical, 7)
+                .foregroundStyle(Color.primary)
+                .background(selected == destination ? WatchTheme.selection : .clear, in: RoundedRectangle(cornerRadius: 7, style: .continuous))
                 .contentShape(Rectangle())
         }.buttonStyle(.plain)
     }
 
     private var pageHeader: some View {
-        HStack(spacing: 12) {
-            VStack(alignment: .leading, spacing: 5) {
+        HStack(spacing: 14) {
+            if let selectedApp { AppBadge(appID: selectedApp.id, size: 40) }
+            VStack(alignment: .leading, spacing: 4) {
                 HStack(spacing: 8) {
-                    Text(title).font(.system(size: 22, weight: .semibold))
-                    if selectedApp?.id == "gemini" || selectedApp?.id == "devin" { Text("实验接入").font(.caption).foregroundStyle(.orange) }
+                    Text(title).font(.system(size: 20, weight: .semibold))
+                    if selectedApp?.id == "gemini" || selectedApp?.id == "devin" { ExperimentTag() }
                 }
-                Text(selected == "settings" ? "通知、外观与实验功能" : selected == "integrations" ? "查看各应用的信号来源和当前限制" : "留在手头的工作，让状态主动找你")
+                Text(selected == "settings" ? "通知、外观与实验功能" : selected == "integrations" ? "查看各应用的信号来源和当前限制"
+                     : selectedApp?.capability ?? "留在手头的工作，让状态主动找你")
                     .font(.system(size: 11)).foregroundStyle(.secondary)
             }
             Spacer()
-            Button { monitor.paused.toggle() } label: { Label(monitor.paused ? "继续监控" : "暂停", systemImage: monitor.paused ? "play" : "pause") }
-                .buttonStyle(.bordered)
-            Button { monitor.showFloatingPanel() } label: { Label("悬浮面板", systemImage: "rectangle.inset.filled") }
-                .buttonStyle(.borderedProminent)
-        }.padding(.horizontal, 26).padding(.vertical, 22)
+            Button { monitor.paused.toggle() } label: {
+                Label(monitor.paused ? "继续监控" : "暂停监控", systemImage: monitor.paused ? "play.fill" : "pause.fill")
+            }.buttonStyle(InkButtonStyle())
+        }.padding(.horizontal, 28).padding(.top, 22).padding(.bottom, 18)
     }
 
     private var sessionPage: some View {
-        VStack(spacing: 18) {
-            HStack(spacing: 12) {
-                MetricTile(title: "运行中", value: appSessions.filter { !$0.stale && $0.state == .running }.count, symbol: "waveform.path", color: .blue)
-                MetricTile(title: "需要处理", value: appSessions.filter { !$0.stale && $0.state.needsAttention }.count, symbol: "bell.badge", color: WatchTheme.accent)
+        VStack(spacing: 16) {
+            HStack(spacing: 10) {
+                MetricTile(title: "运行中", value: appSessions.filter { !$0.stale && $0.state == .running }.count, symbol: "circle.fill", color: SessionState.running.uiColor)
+                MetricTile(title: "需要处理", value: appSessions.filter { !$0.stale && $0.state.needsAttention }.count, symbol: "circle.fill", color: WatchTheme.accent)
                 Button { monitor.markCompletionsRead() } label: {
-                    MetricTile(title: "新结束 · 全部标为已读", value: monitor.completionCount, symbol: "checkmark.circle", color: .green)
+                    MetricTile(title: "新结束 · 点按标为已读", value: monitor.completionCount, symbol: "circle.fill", color: SessionState.responseEnded.uiColor)
                 }.buttonStyle(.plain).help("清除所有应用的新结束标记")
             }
             if monitor.demo {
-                Label("界面演示 · 合成会话数据，不代表真实任务", systemImage: "sparkles")
-                    .font(.caption).foregroundStyle(WatchTheme.accent).frame(maxWidth: .infinity, alignment: .leading)
+                Label("界面演示 · 合成会话数据，不代表真实任务", systemImage: "flask")
+                    .font(.caption).foregroundStyle(.secondary).frame(maxWidth: .infinity, alignment: .leading)
             }
             HStack {
-                HStack(spacing: 3) {
+                HStack(spacing: 2) {
                     ForEach(SessionFilter.allCases, id: \.self) { item in
+                        let count = appSessions.filter(item.includes).count
                         Button { filter = item } label: {
-                            Text(item.rawValue).font(.system(size: 11, weight: filter == item ? .semibold : .regular))
-                                .padding(.horizontal, 12).padding(.vertical, 7)
-                                .foregroundStyle(filter == item ? Color.primary : .secondary)
-                                .background(filter == item ? WatchTheme.surface : .clear, in: RoundedRectangle(cornerRadius: 6))
+                            HStack(spacing: 5) {
+                                Text(item.rawValue)
+                                if count > 0 && item != .all { Text("\(count)").monospacedDigit().opacity(0.6) }
+                            }
+                            .font(.system(size: 11, weight: filter == item ? .semibold : .regular))
+                            .padding(.horizontal, 11).frame(height: 26)
+                            .foregroundStyle(filter == item ? WatchTheme.canvas : .secondary)
+                            .background(filter == item ? WatchTheme.ink : .clear, in: Capsule())
+                            .contentShape(Capsule())
                         }.buttonStyle(.plain)
                     }
-                }.padding(3).background(Color.primary.opacity(0.04), in: RoundedRectangle(cornerRadius: 8))
+                }
                 Spacer(minLength: 8)
                 HStack(spacing: 6) {
                     Image(systemName: "magnifyingglass").foregroundStyle(.tertiary)
                     TextField("搜索应用或会话 ID", text: $query).textFieldStyle(.plain).font(.system(size: 11)).accessibilityLabel("搜索应用或会话标识")
-                }.padding(8).frame(maxWidth: 185).background(WatchTheme.surface, in: RoundedRectangle(cornerRadius: 8))
-                    .overlay(RoundedRectangle(cornerRadius: 8).stroke(WatchTheme.border))
+                }.padding(.horizontal, 10).frame(maxWidth: 200).frame(height: 28)
+                    .background(WatchTheme.selection, in: Capsule())
             }
             ScrollView {
-                LazyVStack(alignment: .leading, spacing: 10) {
-                    if filtered.isEmpty { emptyState }
-                    ForEach(filtered) { session in
-                        SessionCard(session: session, since: monitor.stateSince[session.id] ?? session.updatedAt) { monitor.openApp(session.appID) }
+                if filtered.isEmpty { emptyState }
+                else {
+                    LazyVStack(spacing: 0) {
+                        ForEach(Array(filtered.enumerated()), id: \.element.id) { index, session in
+                            if index > 0 { Divider().padding(.leading, 66) }
+                            SessionCard(session: session, since: monitor.stateSince[session.id] ?? session.updatedAt) { monitor.openApp(session.appID) }
+                        }
                     }
-                }.padding(.bottom, 8)
+                    .groupedSurface()
+                    .padding(.bottom, 8)
+                }
             }
             if let notice = monitor.recentNotices.first {
                 HStack(spacing: 8) {
-                    Image(systemName: "bell").foregroundStyle(WatchTheme.accent)
+                    Image(systemName: "bell").foregroundStyle(.secondary)
                     Text(notice).lineLimit(1); Spacer(); Text("最近提醒").foregroundStyle(.tertiary)
-                }.font(.system(size: 11)).padding(12).background(WatchTheme.accent.opacity(0.06), in: RoundedRectangle(cornerRadius: 8))
+                }.font(.system(size: 11)).padding(.horizontal, 14).frame(height: 34).groupedSurface()
             }
-        }.padding(.horizontal, 26).padding(.top, 22).padding(.bottom, 14)
+        }.padding(.horizontal, 28).padding(.top, 18).padding(.bottom, 14)
     }
 
     private var emptyState: some View {
@@ -192,33 +207,126 @@ struct MonitorDashboard: View {
     private var integrationsPage: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 12) {
+                if !setupComplete { quickStart }
                 Text("进程圆点仅表示应用已打开；收到近期会话事件才表示任务状态可观察。")
-                    .font(.callout).foregroundStyle(.secondary).padding(.bottom, 4)
-                ForEach(liveApps) { app in
-                    HStack(alignment: .top, spacing: 14) {
-                        AppBadge(appID: app.id, size: 36)
-                        VStack(alignment: .leading, spacing: 6) {
-                            HStack {
-                                Text(app.name).font(.system(size: 13, weight: .semibold))
-                                if app.id == "gemini" || app.id == "devin" { Text("实验").font(.caption2).foregroundStyle(.orange) }
+                    .font(.system(size: 12)).foregroundStyle(.secondary)
+                VStack(spacing: 0) {
+                    ForEach(Array(liveApps.enumerated()), id: \.element.id) { index, app in
+                        if index > 0 { Divider().padding(.leading, 68) }
+                        HStack(alignment: .center, spacing: 14) {
+                            AppBadge(appID: app.id, size: 38)
+                            VStack(alignment: .leading, spacing: 4) {
+                                HStack(spacing: 6) {
+                                    Text(app.name).font(.system(size: 13, weight: .semibold))
+                                    if app.id == "gemini" || app.id == "devin" { ExperimentTag() }
+                                }
+                                Text(app.capability).font(.system(size: 11)).foregroundStyle(.secondary)
+                                HStack(spacing: 5) {
+                                    Circle().fill(connectionColor(app)).frame(width: 6, height: 6)
+                                    Text(connectionStatus(app))
+                                }.font(.system(size: 11)).foregroundStyle(.secondary)
+                                if let health = monitor.recordsHealth(for: app.id) { Text(health).font(.system(size: 10)).foregroundStyle(.tertiary) }
                             }
-                            Text(app.capability).font(.system(size: 11)).foregroundStyle(.secondary)
-                            Text(connectionStatus(app)).font(.system(size: 11)).foregroundStyle(.secondary)
-                            if let health = monitor.recordsHealth(for: app.id) { Text(health).font(.system(size: 10)).foregroundStyle(.tertiary) }
-                        }
-                        Spacer()
-                        Button("查看会话") { selected = app.id; filter = .all }.buttonStyle(.bordered).controlSize(.small)
-                    }.padding(16).background(WatchTheme.surface, in: RoundedRectangle(cornerRadius: 12))
-                        .overlay(RoundedRectangle(cornerRadius: 12).stroke(WatchTheme.border))
-                }
+                            Spacer()
+                            hookControl(app)
+                            Button("查看会话") { selected = app.id; filter = .all }.buttonStyle(.bordered).controlSize(.small)
+                        }.padding(.horizontal, 16).padding(.vertical, 13)
+                    }
+                }.groupedSurface()
                 Text("预览版支持范围与客户端版本有关。Gemini 结束判断、Devin 最终结果仍有限制；豆包已移出本版。")
-                    .font(.caption).foregroundStyle(.secondary).padding(.top, 6)
-            }.padding(26)
+                    .font(.caption).foregroundStyle(.secondary).padding(.top, 4)
+            }.padding(.horizontal, 28).padding(.vertical, 20)
+        }
+        .onAppear { monitor.refreshHookStatus() }
+        .alert(pendingHook.map { $0.install ? "接入 " + $0.target.label + "？" : "移除 " + $0.target.label + " 的接入？" } ?? "",
+               isPresented: Binding(get: { pendingHook != nil }, set: { if !$0 { pendingHook = nil } }),
+               presenting: pendingHook) { item in
+            Button(item.install ? "接入" : "移除") { monitor.setHook(item.target, installed: item.install) }
+            Button("取消", role: .cancel) {}
+        } message: { item in
+            Text(item.install
+                 ? "将在 " + item.target.configPath + " 中添加 Agent Watch 的事件通知。修改前自动备份，不改动你已有的设置，可随时移除。" + item.target.followUp
+                 : "只删除 Agent Watch 在 " + item.target.configPath + " 中添加的条目，修改前自动备份。")
+        }
+    }
+
+    private var connectedHooks: Int { monitor.hookStatus.values.filter { $0 == .installed }.count }
+    private var observationReady: Bool { monitor.windowObservation && monitor.accessibilityTrusted }
+    private var setupComplete: Bool { monitor.notificationsEnabled && observationReady && connectedHooks > 0 }
+
+    /// First-run checklist; it disappears once every step is done.
+    private var quickStart: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            HStack(spacing: 8) {
+                BrandMark(size: 22)
+                Text("快速开始").font(.system(size: 13, weight: .semibold))
+                Text("完成下面三步，智能体的状态就会主动找你").font(.system(size: 11)).foregroundStyle(.secondary)
+            }
+            setupStep(1, "开启系统通知", detail: "授权、回答和本轮结束时弹出横幅", done: monitor.notificationsEnabled) {
+                Button("开启") { monitor.grantNotifications() }.buttonStyle(InkButtonStyle())
+            }
+            setupStep(2, "开启窗口观察", detail: "需要辅助功能权限；从应用界面推断状态，作为事件接入的补充", done: observationReady) {
+                Button("开启") { monitor.enableWindowObservation() }.buttonStyle(InkButtonStyle())
+            }
+            setupStep(3, "接入智能体", detail: "在下方列表中点「一键接入」，让 Claude Code、Codex、WorkBuddy 主动报告状态",
+                      done: connectedHooks > 0) { EmptyView() }
+        }
+        .padding(16).groupedSurface()
+    }
+
+    private func setupStep<Control: View>(_ index: Int, _ title: String, detail: String, done: Bool,
+                                          @ViewBuilder control: () -> Control) -> some View {
+        HStack(spacing: 12) {
+            ZStack {
+                Circle().fill(done ? SessionState.responseEnded.uiColor : WatchTheme.selection)
+                if done {
+                    Image(systemName: "checkmark").font(.system(size: 10, weight: .bold)).foregroundStyle(.white)
+                } else {
+                    Text("\(index)").font(.system(size: 11, weight: .semibold)).foregroundStyle(.secondary)
+                }
+            }.frame(width: 22, height: 22)
+            VStack(alignment: .leading, spacing: 2) {
+                Text(title).font(.system(size: 12, weight: .medium))
+                Text(detail).font(.system(size: 11)).foregroundStyle(.secondary)
+            }
+            Spacer()
+            if done { Text("已完成").font(.system(size: 11)).foregroundStyle(.secondary) } else { control() }
+        }
+    }
+
+    @ViewBuilder
+    private func hookControl(_ app: LiveApp) -> some View {
+        if let target = HookTarget(catalogID: app.id) {
+            if monitor.hookBusy.contains(target) {
+                ProgressView().controlSize(.small)
+            } else {
+                switch monitor.hookStatus[target] {
+                case .installed?:
+                    Menu("已接入") {
+                        Button("移除接入", role: .destructive) { pendingHook = PendingHook(target: target, install: false) }
+                    }
+                    .menuStyle(.borderlessButton).fixedSize().foregroundStyle(SessionState.responseEnded.uiColor)
+                    .help(target.followUp)
+                case .needsUpdate?:
+                    Button("更新接入") { pendingHook = PendingHook(target: target, install: true) }
+                        .buttonStyle(.bordered).controlSize(.small)
+                case .notInstalled?:
+                    Button("一键接入") { pendingHook = PendingHook(target: target, install: true) }
+                        .buttonStyle(InkButtonStyle())
+                case .unavailable(let reason)?:
+                    Text(reason).font(.system(size: 11)).foregroundStyle(.secondary)
+                case nil:
+                    ProgressView().controlSize(.small)
+                }
+            }
         }
     }
 
     private func connectionStatus(_ app: LiveApp) -> String {
         if monitor.sessions.contains(where: { app.contains($0.appID) && $0.evidence == .explicit && !$0.stale }) { return "已收到近期会话事件" }
+        if let target = HookTarget(catalogID: app.id), monitor.hookStatus[target] == .notInstalled {
+            return "尚未接入事件 · 点右侧「一键接入」"
+        }
         guard monitor.runningApps.contains(app.id) else { return "应用未运行" }
         guard monitor.windowObservation else { return "应用已打开 · 等待任务事件（窗口观察已关闭）" }
         let code = monitor.diagnostics[app.id] ?? ""
@@ -226,6 +334,13 @@ struct MonitorDashboard: View {
         if code.contains("unsupported") || code.contains("mismatch") { return "当前版本或界面结构尚未验证" }
         if code.contains("unavailable") || code.contains("error") { return "窗口暂不可读 · 事件接入继续运行" }
         return "应用已打开 · 尚无可确认的任务信号"
+    }
+
+    private func connectionColor(_ app: LiveApp) -> Color {
+        if monitor.sessions.contains(where: { app.contains($0.appID) && $0.evidence == .explicit && !$0.stale }) {
+            return SessionState.responseEnded.uiColor
+        }
+        return monitor.runningApps.contains(app.id) ? WatchTheme.accent.opacity(0.8) : Color.secondary.opacity(0.35)
     }
 
     private var settingsPage: some View {
@@ -238,7 +353,7 @@ struct MonitorDashboard: View {
                         }.labelsHidden().frame(width: 130)
                     }
                     Divider()
-                    settingRow("主窗口置顶", detail: "悬浮面板始终保持在其他窗口上方") {
+                    settingRow("主窗口置顶", detail: "让监控面板保持在其他窗口上方") {
                         Toggle("主窗口置顶", isOn: $pinned).labelsHidden().toggleStyle(.switch)
                             .onChange(of: pinned) { _, value in NSApp.keyWindow?.level = value ? .floating : .normal }
                     }
@@ -248,6 +363,14 @@ struct MonitorDashboard: View {
                         Button(monitor.notificationsEnabled ? "已开启" : "开启通知") { monitor.grantNotifications() }.buttonStyle(.bordered)
                     }
                     Divider()
+                    settingRow("完成提示音", detail: "本轮结束时播放“玻璃”音效，并替代该条系统通知的默认声音") {
+                        HStack(spacing: 8) {
+                            Button { NSSound(named: "Glass")?.play() } label: { Image(systemName: "speaker.wave.2") }
+                                .buttonStyle(.borderless).help("试听").accessibilityLabel("试听完成提示音")
+                            Toggle("完成提示音", isOn: $monitor.completionChime).labelsHidden().toggleStyle(.switch)
+                        }
+                    }
+                    Divider()
                     settingRow("辅助功能权限", detail: "仅实验窗口观察需要；本地事件接入无需此权限") {
                         Button("检查权限") { monitor.grantAccessibility() }.buttonStyle(.bordered)
                     }
@@ -255,6 +378,10 @@ struct MonitorDashboard: View {
                 settingsSection("实验功能", symbol: "flask") {
                     settingRow("窗口观察", detail: "只读取可访问的状态控件；隐藏会话可能不可观察") {
                         Toggle("窗口观察", isOn: $monitor.windowObservation).labelsHidden().toggleStyle(.switch)
+                    }
+                    Divider()
+                    settingRow("Claude Code 结束提醒", detail: "依据 Claude Code 的 Stop 事件推断本轮结束；若被其他 hook 拦下继续运行，可能提前提醒") {
+                        Toggle("Claude Code 结束提醒", isOn: $monitor.notifyClaudeCodeEnds).labelsHidden().toggleStyle(.switch)
                     }
                     Divider()
                     settingRow("Gemini 结束提醒", detail: "界面推断，尚未通过完整实测；需同时开启窗口观察") {
@@ -283,15 +410,15 @@ struct MonitorDashboard: View {
                 }
                 Text("Agent Watch 0.4.0 Preview · Apache-2.0\n本轮回复结束不代表整个目标已完成。所有监控在本机进行，无遥测和模型调用。")
                     .font(.system(size: 11)).foregroundStyle(.secondary).lineSpacing(5)
-            }.padding(26)
+            }.padding(.horizontal, 28).padding(.vertical, 20)
         }
     }
 
     private func settingsSection<Content: View>(_ title: String, symbol: String, @ViewBuilder content: () -> Content) -> some View {
-        VStack(alignment: .leading, spacing: 14) {
-            Label(title, systemImage: symbol).font(.system(size: 13, weight: .semibold))
-            VStack(spacing: 12, content: content).padding(16).background(WatchTheme.surface, in: RoundedRectangle(cornerRadius: 12))
-                .overlay(RoundedRectangle(cornerRadius: 12).stroke(WatchTheme.border))
+        VStack(alignment: .leading, spacing: 8) {
+            Label(title, systemImage: symbol).font(.system(size: 11, weight: .semibold)).foregroundStyle(.secondary)
+                .padding(.leading, 4)
+            VStack(spacing: 12, content: content).padding(16).groupedSurface()
         }
     }
     private func settingRow<Control: View>(_ title: String, detail: String, @ViewBuilder control: () -> Control) -> some View {
@@ -306,43 +433,86 @@ struct MonitorDashboard: View {
     }
     private var footer: some View {
         HStack(spacing: 7) {
-            Circle().fill(monitor.paused ? Color.orange : Color.green).frame(width: 5, height: 5)
+            Circle().fill(monitor.paused ? Color.orange : SessionState.responseEnded.uiColor).frame(width: 5, height: 5)
             Text(monitor.paused ? "已暂停 · 显示最后一次结果" : monitor.statusMessage).lineLimit(1)
             Spacer()
             if let date = monitor.lastScan { Text(date, style: .time).monospacedDigit() }
             Image(systemName: "lock.shield").help("仅本机保存状态元数据")
-        }.font(.system(size: 10)).foregroundStyle(.secondary).padding(.horizontal, 26).padding(.vertical, 11)
-            .background(WatchTheme.surface).overlay(alignment: .top) { Rectangle().fill(WatchTheme.border).frame(height: 1) }
+        }.font(.system(size: 10)).foregroundStyle(.secondary).padding(.horizontal, 28).padding(.vertical, 10)
+            .overlay(alignment: .top) { Rectangle().fill(WatchTheme.border).frame(height: 1) }
     }
 }
 
+/// One row of the grouped session list.
 private struct SessionCard: View {
     let session: SessionSnapshot
     let since: Date
     let openApp: () -> Void
+    @State private var hovering = false
+    private var needsAttention: Bool { !session.stale && session.state.needsAttention }
     var body: some View {
         HStack(alignment: .center, spacing: 14) {
-            AppBadge(appID: session.appID, size: 38)
-            VStack(alignment: .leading, spacing: 7) {
+            ZStack(alignment: .bottomTrailing) {
+                AppBadge(appID: session.appID, size: 36)
+                if !session.stale && session.state != .unknown {
+                    PulsingDot(color: session.state.uiColor, size: 9, pulsing: session.state == .running || needsAttention)
+                        .overlay { Circle().strokeBorder(WatchTheme.surface, lineWidth: 2).frame(width: 13, height: 13) }
+                        .offset(x: 2, y: 2)
+                }
+            }
+            VStack(alignment: .leading, spacing: 5) {
                 HStack(spacing: 8) {
                     Text(appName(session.appID)).font(.system(size: 13, weight: .semibold))
-                    Text(session.appID == "demo" ? "演示" : "会话 " + String(session.sessionID.prefix(8))).font(.system(size: 10, design: .monospaced)).foregroundStyle(.tertiary)
-                    Spacer(minLength: 0)
-                    StatePill(state: session.state, stale: session.stale)
+                    Text(session.appID == "demo" ? "演示" : String(session.sessionID.prefix(8))).font(.system(size: 10, design: .monospaced)).foregroundStyle(.tertiary)
                 }
-                HStack(spacing: 8) {
+                HStack(spacing: 6) {
                     Label(session.evidence == .inferred ? "推断信号" : "明确事件", systemImage: session.evidence == .inferred ? "sparkle.magnifyingglass" : "checkmark.shield")
-                    Text(session.isWindowObservation ? "窗口观察" : "事件会话")
-                    if session.state == .responseEnded { Text("仅当前轮次") }
-                    if session.parentSessionID != nil { Text("子任务") }
-                    if session.stale { Text([.responseEnded, .failed, .cancelled].contains(session.state) ? "历史记录" : "信息已过期") }
-                    Spacer()
-                    Text(since, style: .relative).monospacedDigit()
-                }.font(.system(size: 10)).foregroundStyle(.secondary)
+                    Text("·"); Text(session.isWindowObservation ? "窗口观察" : "事件会话")
+                    if session.state == .responseEnded { Text("·"); Text("仅当前轮次") }
+                    if session.parentSessionID != nil { Text("·"); Text("子任务") }
+                    if session.stale { Text("·"); Text([.responseEnded, .failed, .cancelled].contains(session.state) ? "历史记录" : "信息已过期") }
+                }.font(.system(size: 10)).foregroundStyle(.secondary).lineLimit(1)
             }
-            Button(action: openApp) { Image(systemName: "arrow.up.forward").font(.system(size: 12, weight: .medium)).frame(width: 26, height: 28) }
-                .buttonStyle(.bordered).disabled(session.appID == "demo").help("打开应用；暂不支持定位到具体会话").accessibilityLabel("打开" + appName(session.appID))
-        }.padding(15).background(WatchTheme.surface, in: RoundedRectangle(cornerRadius: 12))
-            .overlay(RoundedRectangle(cornerRadius: 12).stroke(!session.stale && session.state.needsAttention ? WatchTheme.accent.opacity(0.4) : WatchTheme.border))
+            Spacer(minLength: 8)
+            VStack(alignment: .trailing, spacing: 5) {
+                StatePill(state: session.state, stale: session.stale)
+                Text(since, style: .relative).font(.system(size: 10)).monospacedDigit().foregroundStyle(.tertiary)
+            }
+            Button(action: openApp) {
+                Image(systemName: "arrow.up.forward").font(.system(size: 11, weight: .semibold))
+                    .frame(width: 28, height: 28)
+                    .background(Color.primary.opacity(hovering ? 0.09 : 0.05), in: Circle())
+            }
+            .buttonStyle(.plain).foregroundStyle(.secondary)
+            .disabled(session.appID == "demo").opacity(session.appID == "demo" ? 0.4 : 1)
+            .help("打开应用；暂不支持定位到具体会话").accessibilityLabel("打开" + appName(session.appID))
+        }
+        .padding(.horizontal, 16).padding(.vertical, 12)
+        .background(needsAttention ? WatchTheme.accent.opacity(0.06) : hovering ? Color.primary.opacity(0.025) : .clear)
+        .contentShape(Rectangle())
+        .onHover { hovering = $0 }
     }
+}
+
+private struct ExperimentTag: View {
+    var body: some View {
+        Text("实验").font(.system(size: 9, weight: .semibold)).foregroundStyle(.secondary)
+            .padding(.horizontal, 5).padding(.vertical, 1.5)
+            .overlay(Capsule().strokeBorder(Color.secondary.opacity(0.4), lineWidth: 0.5))
+    }
+}
+
+extension View {
+    /// A single rounded container that holds rows separated by dividers.
+    func groupedSurface() -> some View {
+        let shape = RoundedRectangle(cornerRadius: 12, style: .continuous)
+        return self.background(WatchTheme.surface, in: shape).clipShape(shape)
+            .overlay(shape.strokeBorder(WatchTheme.border, lineWidth: 1))
+    }
+}
+
+private struct PendingHook: Identifiable {
+    let target: HookTarget
+    let install: Bool
+    var id: String { target.rawValue + (install ? ":install" : ":remove") }
 }

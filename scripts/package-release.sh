@@ -5,7 +5,7 @@ set -euo pipefail
 # developer's existing app bundle or reusing a previous build directory.
 project_dir="$(cd "$(dirname "$0")/.." && pwd -P)"
 version="0.4.0"
-build_number="8"
+build_number="9"
 release_label="${version}-preview.${build_number}"
 build_triple="arm64-apple-macosx14.0"
 source_ref="HEAD"
@@ -261,13 +261,13 @@ required = {
     prefix + "Resources/AgentWatch.icns",
     prefix + "scripts/package-release.sh",
     prefix + "docs/INSTALLATION.md",
-    prefix + "docs/RELEASE-NOTES-0.4.0-preview.8.md",
+    prefix + "docs/RELEASE-NOTES-0.4.0-preview.9.md",
 }
 if not required.issubset(set(names)):
     raise SystemExit("package-release: source ZIP is missing required source files")
 PY
 
-notes_source="$project_dir/docs/RELEASE-NOTES-0.4.0-preview.8.md"
+notes_source="$project_dir/docs/RELEASE-NOTES-0.4.0-preview.9.md"
 [[ -f "$notes_source" ]] || die "release notes are missing"
 [[ -f "$project_dir/docs/INSTALLATION.md" && -f "$project_dir/LICENSE" ]] \
   || die "DMG installation README or license is missing"
