@@ -179,8 +179,8 @@ final class MenuBarController: NSObject, NSApplicationDelegate, NSPopoverDelegat
                                           since: monitor.stateSince)
         let notices = apps.filter { $0.notice != nil }
         let noticeAnchor = notices.isEmpty ? nil : notificationAnchor()
-        // Approval requests block the agent, so they stay until handled or dismissed.
-        let persistent = notices.contains { $0.notice?.state == .waitingApproval }
+        // Approval requests and questions block the agent, so they stay until handled or dismissed.
+        let persistent = notices.contains { $0.notice?.state.isWaiting == true }
         if let noticeAnchor {
             let keys = Set(notices.compactMap(\.notice).flatMap(\.keys))
             if !keys.isSubset(of: displayedAlerts) {

@@ -29,9 +29,22 @@ final class MonitorModel: NSObject, ObservableObject, UNUserNotificationCenterDe
         }
     }
     @Published var dashboardPage = "all"
-    @Published var windowObservation = false
-    @Published var notifyInferred = false
-    @Published var notifyWindowCompletions = false
+    // Experimental switches stay off by default and keep the user's choice across launches.
+    @Published var windowObservation = WatchPreferences.store.bool(forKey: "windowObservation") {
+        didSet { WatchPreferences.store.set(windowObservation, forKey: "windowObservation") }
+    }
+    @Published var notifyInferred = WatchPreferences.store.bool(forKey: "notifyInferred") {
+        didSet { WatchPreferences.store.set(notifyInferred, forKey: "notifyInferred") }
+    }
+    @Published var notifyWindowCompletions = WatchPreferences.store.bool(forKey: "notifyWindowCompletions") {
+        didSet { WatchPreferences.store.set(notifyWindowCompletions, forKey: "notifyWindowCompletions") }
+    }
+    /// Claude Code turn ends come from its Stop hook; on by default because records cannot confirm them.
+    @Published var notifyClaudeCodeEnds = WatchPreferences.store.object(forKey: "notifyClaudeCodeEnds") as? Bool ?? true {
+        didSet { WatchPreferences.store.set(notifyClaudeCodeEnds, forKey: "notifyClaudeCodeEnds") }
+    }
+    @Published private(set) var hookStatus: [HookTarget: HookStatus] = [:]
+    @Published private(set) var hookBusy = Set<HookTarget>()
     @Published var notificationsEnabled = false
     @Published var statusMessage = "等待首次采集"
     @Published var recentNotices: [String] = []
@@ -56,12 +69,14 @@ final class MonitorModel: NSObject, ObservableObject, UNUserNotificationCenterDe
     private let geminiCollector = GeminiCollector()
     private var demoTurn = UUID().uuidString
     private var lastChime = Date.distantPast
+    private let isPreview: Bool
     private var engineCache = SnapshotFileCache()
     private var completionCache = SnapshotFileCache()
 
     override convenience init() { self.init(preview: false) }
 
     init(preview: Bool) {
+        isPreview = preview
         supportDirectory = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Library/Application Support/Agent Watch")
         collector = MonitorCollector(directory: supportDirectory.appendingPathComponent("events"))
         super.init()
@@ -86,6 +101,7 @@ final class MonitorModel: NSObject, ObservableObject, UNUserNotificationCenterDe
             demo = true
             lastScan = now
             statusMessage = "界面预览 · 合成数据，未运行采集器"
+            hookStatus = [.claudeCode: .installed, .codex: .notInstalled, .workbuddy: .needsUpdate]
             return
         }
         let completionPath = supportDirectory.appendingPathComponent("completions.json")
@@ -112,6 +128,12 @@ final class MonitorModel: NSObject, ObservableObject, UNUserNotificationCenterDe
             sessions = store.sessions.filter { !($0.isWindowObservation && $0.stale) }
         }
         UNUserNotificationCenter.current().delegate = self
+        // The first launch opens on the integrations page, where the setup checklist lives.
+        if !WatchPreferences.store.bool(forKey: "onboardingSeen") {
+            dashboardPage = "integrations"
+            WatchPreferences.store.set(true, forKey: "onboardingSeen")
+        }
+        refreshHookStatus()
         demo = CommandLine.arguments.contains("--demo")
         try? FileManager.default.createDirectory(at: supportDirectory, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
         Task {
@@ -180,6 +202,7 @@ final class MonitorModel: NSObject, ObservableObject, UNUserNotificationCenterDe
         }
     }
 
+    var accessibilityTrusted: Bool { AXIsProcessTrusted() }
     var attentionCount: Int { sessions.filter { $0.state.needsAttention && !$0.stale }.count }
     var activeCount: Int { sessions.filter { $0.state == .running && !$0.stale }.count }
     var completionCount: Int { completions.count }
@@ -261,7 +284,7 @@ final class MonitorModel: NSObject, ObservableObject, UNUserNotificationCenterDe
                 }
                 if now.timeIntervalSince(event.observedAt) <= 30,
                    allowsNotice(appID: notice.appID, state: notice.state, evidence: notice.evidence, source: event.source) {
-                    if notice.state == .waitingApproval || notice.state == .responseEnded {
+                    if Self.floatingStates.contains(notice.state) {
                         alerts.insert(FloatingAlertKey(appID: event.appID, sessionID: event.sessionID,
                                                        turnID: event.turnID, state: notice.state))
                     }
@@ -292,13 +315,13 @@ final class MonitorModel: NSObject, ObservableObject, UNUserNotificationCenterDe
         stateSince = stateSince.filter { activeIDs.contains($0.key) }
 
         let currentAlerts = sessions.filter { session in
-            !session.stale && (session.state == .waitingApproval || session.state == .responseEnded)
+            !session.stale && Self.floatingStates.contains(session.state)
                 && allowsNotice(appID: session.appID, state: session.state, evidence: session.evidence, source: session.source)
         }
         if !notifyInferred {
-            for session in currentAlerts where session.state == .waitingApproval && now.timeIntervalSince(session.updatedAt) <= 30 {
+            for session in currentAlerts where session.state.isWaiting && now.timeIntervalSince(session.updatedAt) <= 30 {
                 let previous = before[session.id]
-                if previous?.state == .waitingApproval && previous?.evidence == .inferred && previous?.turnID == session.turnID {
+                if previous?.state == session.state && previous?.evidence == .inferred && previous?.turnID == session.turnID {
                     alerts.insert(FloatingAlertKey(session))
                 }
             }
@@ -314,9 +337,15 @@ final class MonitorModel: NSObject, ObservableObject, UNUserNotificationCenterDe
         return true
     }
 
+    /// States that bring up the notch notice.
+    private static let floatingStates: Set<SessionState> = [.waitingApproval, .waitingInput, .responseEnded]
+
     private func allowsNotice(appID: String, state: SessionState, evidence: EvidenceKind, source: String) -> Bool {
         if state == .responseEnded && isInferredGeminiWindow(appID: appID, evidence: evidence, source: source) {
             return notifyWindowCompletions
+        }
+        if state == .responseEnded && source == claudeCodeInferredStopSource {
+            return notifyClaudeCodeEnds
         }
         return evidence == .explicit || notifyInferred
     }
@@ -341,6 +370,35 @@ final class MonitorModel: NSObject, ObservableObject, UNUserNotificationCenterDe
                 diagnostics["notifications"] = "authorization_request_failed_code_\((error as NSError).code)"
                 statusMessage = "系统通知暂不可用；面板提醒仍可使用"
             }
+        }
+    }
+
+    /// Turns on experimental window observation and asks the system for the permission it needs.
+    func enableWindowObservation() {
+        windowObservation = true
+        if !AXIsProcessTrusted() { grantAccessibility() }
+    }
+
+    func refreshHookStatus() {
+        guard !isPreview else { return }
+        Task {
+            for target in HookTarget.allCases where !hookBusy.contains(target) {
+                let status = await HookInstaller.status(of: target)
+                if hookStatus[target] != status { hookStatus[target] = status }
+            }
+        }
+    }
+
+    /// Installs or removes one agent's event bridge after the user confirmed it in the interface.
+    func setHook(_ target: HookTarget, installed: Bool) {
+        guard !isPreview, !hookBusy.contains(target) else { return }
+        hookBusy.insert(target)
+        Task {
+            let succeeded = await HookInstaller.apply(target, uninstall: !installed)
+            hookStatus[target] = await HookInstaller.status(of: target)
+            hookBusy.remove(target)
+            statusMessage = !succeeded ? target.label + " 接入未完成；可在终端运行 adapters/manage_hooks.py 查看原因"
+                : installed ? target.label + " 已接入。" + target.followUp : target.label + " 已移除接入"
         }
     }
 
@@ -389,7 +447,7 @@ final class MonitorModel: NSObject, ObservableObject, UNUserNotificationCenterDe
     }
 
     private func deliver(_ notice: MonitorNotice, bundleID: String?) {
-        let iconFile = notice.state == .waitingApproval ? notificationIcon(appID: notice.appID, bundleID: bundleID) : nil
+        let iconFile = notice.state.isWaiting ? notificationIcon(appID: notice.appID, bundleID: bundleID) : nil
         let message = appName(notice.appID) + " · " + notice.state.label + (notice.evidence == .inferred ? "（推断）" : "")
         recentNotices.insert(message, at: 0)
         recentNotices = Array(recentNotices.prefix(20))
@@ -414,7 +472,11 @@ final class MonitorModel: NSObject, ObservableObject, UNUserNotificationCenterDe
             // The agent leads the title so a glance tells which one needs attention.
             content.title = appName(notice.appID)
             content.subtitle = notice.state.label + (notice.evidence == .inferred ? "（推断）" : "")
-            content.body = notice.state == .waitingApproval ? "点按切换到该应用进行授权" : "点按切换到该应用"
+            content.body = switch notice.state {
+            case .waitingApproval: "点按切换到该应用进行授权"
+            case .waitingInput: "点按切换到该应用回答问题"
+            default: "点按切换到该应用"
+            }
             content.sound = chimes ? nil : .default
             content.threadIdentifier = notice.appID
             content.userInfo = ["appID": notice.appID, "bundleID": bundleID ?? ""]

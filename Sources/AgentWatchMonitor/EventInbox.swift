@@ -159,9 +159,22 @@ actor MonitorCollector {
     }
 }
 
+/// Source of a Claude Code turn end inferred from its main-session Stop hook.
+let claudeCodeInferredStopSource = "claude_code:Stop:inferred_end"
+
 /// Legacy Stop observers report intent before the host has decided whether to
 /// continue. Durable lifecycle records are the confirmation source.
 func normalizeLifecycleEvidence(_ event: MonitorEvent) -> MonitorEvent {
+    // Current Claude Code session records omit the fields that confirm a turn end,
+    // so the main Stop hook becomes an inferred end. Another hook can still block
+    // that Stop, which is why it is never reported as explicit.
+    if event.appID == "claude_code" && event.source == "claude_code:Stop" && event.state == .responseEnded {
+        return MonitorEvent(id: event.id, appID: event.appID, sessionID: event.sessionID,
+                            turnID: event.turnID, state: .responseEnded, evidence: .inferred,
+                            observedAt: event.observedAt, sequence: event.sequence,
+                            parentSessionID: event.parentSessionID,
+                            source: claudeCodeInferredStopSource, identityScope: event.identityScope)
+    }
     let stopIntent = ["codex", "claude_code"].contains(event.appID)
         && [event.appID + ":Stop", event.appID + ":SubagentStop"].contains(event.source)
     let devinIntent = event.appID == "devin"

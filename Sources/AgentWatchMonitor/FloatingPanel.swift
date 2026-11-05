@@ -87,6 +87,13 @@ struct HoverAppStatus: Identifiable, Equatable {
                           since: waiting.map { since[$0.id] ?? $0.updatedAt }.min(),
                           agentName: agentName(waiting, catalogID: catalogID))
         }
+        let questions = matching.filter { $0.state == .waitingInput }
+        if !questions.isEmpty {
+            let title = questions.contains { $0.evidence == .explicit } ? "等待回答" : "推断待回答"
+            return Notice(state: .waitingInput, title: title, keys: keys,
+                          since: questions.map { since[$0.id] ?? $0.updatedAt }.min(),
+                          agentName: agentName(questions, catalogID: catalogID))
+        }
         let finished = matching.filter { $0.state == .responseEnded }
         guard !finished.isEmpty else { return nil }
         let title = finished.contains { $0.evidence == .explicit } ? "本轮已结束" : "推断已结束"
@@ -230,7 +237,7 @@ struct HoverStatusStrip: View {
 
     /// Approval notices stay until handled, so they show how long the agent has been blocked.
     private var waitingSince: Date? {
-        apps.compactMap { $0.notice?.state == .waitingApproval ? $0.notice?.since : nil }.min()
+        apps.compactMap { $0.notice?.state.isWaiting == true ? $0.notice?.since : nil }.min()
     }
 
     private func displayName(_ app: HoverAppStatus) -> String {
@@ -242,6 +249,8 @@ struct HoverStatusStrip: View {
         switch noticeState {
         case .waitingApproval:
             return (single.map { $0 + " 需要你授权" } ?? "\(apps.count) 个应用等待授权", WatchTheme.accent)
+        case .waitingInput:
+            return (single.map { $0 + " 在等你回答" } ?? "\(apps.count) 个应用等待回答", WatchTheme.accent)
         case .responseEnded:
             return (single.map { $0 + " 本轮结束" } ?? "\(apps.count) 个应用本轮结束", SessionState.responseEnded.uiColor)
         default: return ("\(apps.count) 个应用有新提醒", WatchTheme.accent)
@@ -322,12 +331,21 @@ struct HoverStatusStrip: View {
         .frame(height: headerHeight)
     }
 
+    /// Verb for what the user has to do in the waiting agent.
+    private var waitingAction: String {
+        switch noticeState {
+        case .waitingApproval: return "授权"
+        case .waitingInput: return "回答"
+        default: return "处理"
+        }
+    }
+
     private var waitingFooter: some View {
         HStack(spacing: 5) {
             Image(systemName: "arrow.turn.down.right")
-            Text(apps.count == 1 ? "点按切换过去授权" : "点按对应应用切换过去授权")
+            Text(apps.count == 1 ? "点按切换过去" + waitingAction : "点按对应应用切换过去" + waitingAction)
             Spacer()
-            Text("授权后自动收起").foregroundStyle(.tertiary)
+            Text(waitingAction + "后自动收起").foregroundStyle(.tertiary)
         }
         .font(.system(size: 11))
         .foregroundStyle(.secondary)
@@ -372,7 +390,7 @@ struct HoverStatusStrip: View {
                             .font(.system(size: 11))
                             .foregroundStyle(.secondary)
                     }
-                    if notice?.state == .waitingApproval, let since = notice?.since {
+                    if notice?.state.isWaiting == true, let since = notice?.since {
                         TimelineView(.periodic(from: since, by: 1)) { context in
                             Text("· 已等 " + turnDurationText(context.date.timeIntervalSince(since)))
                                 .monospacedDigit()
@@ -394,7 +412,7 @@ struct HoverStatusStrip: View {
                     label.frame(maxWidth: .infinity, alignment: .leading)
                     if showsNotices && !compact {
                         if apps.count == 1 && size.width >= 244 {
-                            Text(notice?.state == .waitingApproval ? "去授权" : "打开")
+                            Text(notice?.state == .waitingApproval ? "去授权" : notice?.state == .waitingInput ? "去回答" : "打开")
                                 .font(.system(size: 11, weight: .semibold))
                                 .foregroundStyle(.white)
                                 .padding(.horizontal, 11)
@@ -517,7 +535,7 @@ private struct NoticeMark: View {
                         .animation(reduceMotion ? nil : .spring(response: 0.32, dampingFraction: 0.5).delay(0.5), value: played)
                 }
             } else {
-                Image(systemName: state == .waitingApproval ? "hand.raised.fill" : "bell.fill")
+                Image(systemName: state == .waitingApproval ? "hand.raised.fill" : state == .waitingInput ? "text.bubble.fill" : "bell.fill")
                     .font(.system(size: 13, weight: .semibold))
                     .foregroundStyle(color)
                     .symbolEffect(.bounce, options: .repeat(2), value: played)

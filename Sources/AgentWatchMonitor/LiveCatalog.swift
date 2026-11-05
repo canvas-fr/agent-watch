@@ -47,4 +47,6 @@ extension SessionState {
         }
     }
     var needsAttention: Bool { self == .waitingApproval || self == .waitingInput || self == .failed }
+    /// The agent is blocked until the user acts.
+    var isWaiting: Bool { self == .waitingApproval || self == .waitingInput }
 }

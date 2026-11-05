@@ -24,6 +24,7 @@ struct MonitorDashboard: View {
     @State private var filter = SessionFilter.all
     @State private var query = ""
     @State private var pinned = false
+    @State private var pendingHook: PendingHook?
     @AppStorage("appearance", store: WatchPreferences.store) private var appearance = "system"
 
     private var selectedApp: LiveApp? { liveApps.first { $0.id == selected } }
@@ -206,6 +207,7 @@ struct MonitorDashboard: View {
     private var integrationsPage: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 12) {
+                if !setupComplete { quickStart }
                 Text("进程圆点仅表示应用已打开；收到近期会话事件才表示任务状态可观察。")
                     .font(.system(size: 12)).foregroundStyle(.secondary)
                 VStack(spacing: 0) {
@@ -226,6 +228,7 @@ struct MonitorDashboard: View {
                                 if let health = monitor.recordsHealth(for: app.id) { Text(health).font(.system(size: 10)).foregroundStyle(.tertiary) }
                             }
                             Spacer()
+                            hookControl(app)
                             Button("查看会话") { selected = app.id; filter = .all }.buttonStyle(.bordered).controlSize(.small)
                         }.padding(.horizontal, 16).padding(.vertical, 13)
                     }
@@ -234,10 +237,96 @@ struct MonitorDashboard: View {
                     .font(.caption).foregroundStyle(.secondary).padding(.top, 4)
             }.padding(.horizontal, 28).padding(.vertical, 20)
         }
+        .onAppear { monitor.refreshHookStatus() }
+        .alert(pendingHook.map { $0.install ? "接入 " + $0.target.label + "？" : "移除 " + $0.target.label + " 的接入？" } ?? "",
+               isPresented: Binding(get: { pendingHook != nil }, set: { if !$0 { pendingHook = nil } }),
+               presenting: pendingHook) { item in
+            Button(item.install ? "接入" : "移除") { monitor.setHook(item.target, installed: item.install) }
+            Button("取消", role: .cancel) {}
+        } message: { item in
+            Text(item.install
+                 ? "将在 " + item.target.configPath + " 中添加 Agent Watch 的事件通知。修改前自动备份，不改动你已有的设置，可随时移除。" + item.target.followUp
+                 : "只删除 Agent Watch 在 " + item.target.configPath + " 中添加的条目，修改前自动备份。")
+        }
+    }
+
+    private var connectedHooks: Int { monitor.hookStatus.values.filter { $0 == .installed }.count }
+    private var observationReady: Bool { monitor.windowObservation && monitor.accessibilityTrusted }
+    private var setupComplete: Bool { monitor.notificationsEnabled && observationReady && connectedHooks > 0 }
+
+    /// First-run checklist; it disappears once every step is done.
+    private var quickStart: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            HStack(spacing: 8) {
+                BrandMark(size: 22)
+                Text("快速开始").font(.system(size: 13, weight: .semibold))
+                Text("完成下面三步，智能体的状态就会主动找你").font(.system(size: 11)).foregroundStyle(.secondary)
+            }
+            setupStep(1, "开启系统通知", detail: "授权、回答和本轮结束时弹出横幅", done: monitor.notificationsEnabled) {
+                Button("开启") { monitor.grantNotifications() }.buttonStyle(InkButtonStyle())
+            }
+            setupStep(2, "开启窗口观察", detail: "需要辅助功能权限；从应用界面推断状态，作为事件接入的补充", done: observationReady) {
+                Button("开启") { monitor.enableWindowObservation() }.buttonStyle(InkButtonStyle())
+            }
+            setupStep(3, "接入智能体", detail: "在下方列表中点「一键接入」，让 Claude Code、Codex、WorkBuddy 主动报告状态",
+                      done: connectedHooks > 0) { EmptyView() }
+        }
+        .padding(16).groupedSurface()
+    }
+
+    private func setupStep<Control: View>(_ index: Int, _ title: String, detail: String, done: Bool,
+                                          @ViewBuilder control: () -> Control) -> some View {
+        HStack(spacing: 12) {
+            ZStack {
+                Circle().fill(done ? SessionState.responseEnded.uiColor : WatchTheme.selection)
+                if done {
+                    Image(systemName: "checkmark").font(.system(size: 10, weight: .bold)).foregroundStyle(.white)
+                } else {
+                    Text("\(index)").font(.system(size: 11, weight: .semibold)).foregroundStyle(.secondary)
+                }
+            }.frame(width: 22, height: 22)
+            VStack(alignment: .leading, spacing: 2) {
+                Text(title).font(.system(size: 12, weight: .medium))
+                Text(detail).font(.system(size: 11)).foregroundStyle(.secondary)
+            }
+            Spacer()
+            if done { Text("已完成").font(.system(size: 11)).foregroundStyle(.secondary) } else { control() }
+        }
+    }
+
+    @ViewBuilder
+    private func hookControl(_ app: LiveApp) -> some View {
+        if let target = HookTarget(catalogID: app.id) {
+            if monitor.hookBusy.contains(target) {
+                ProgressView().controlSize(.small)
+            } else {
+                switch monitor.hookStatus[target] {
+                case .installed?:
+                    Menu("已接入") {
+                        Button("移除接入", role: .destructive) { pendingHook = PendingHook(target: target, install: false) }
+                    }
+                    .menuStyle(.borderlessButton).fixedSize().foregroundStyle(SessionState.responseEnded.uiColor)
+                    .help(target.followUp)
+                case .needsUpdate?:
+                    Button("更新接入") { pendingHook = PendingHook(target: target, install: true) }
+                        .buttonStyle(.bordered).controlSize(.small)
+                case .notInstalled?:
+                    Button("一键接入") { pendingHook = PendingHook(target: target, install: true) }
+                        .buttonStyle(InkButtonStyle())
+                case .unavailable(let reason)?:
+                    Text(reason).font(.system(size: 11)).foregroundStyle(.secondary)
+                case nil:
+                    ProgressView().controlSize(.small)
+                }
+            }
+        }
     }
 
     private func connectionStatus(_ app: LiveApp) -> String {
         if monitor.sessions.contains(where: { app.contains($0.appID) && $0.evidence == .explicit && !$0.stale }) { return "已收到近期会话事件" }
+        if let target = HookTarget(catalogID: app.id), monitor.hookStatus[target] == .notInstalled {
+            return "尚未接入事件 · 点右侧「一键接入」"
+        }
         guard monitor.runningApps.contains(app.id) else { return "应用未运行" }
         guard monitor.windowObservation else { return "应用已打开 · 等待任务事件（窗口观察已关闭）" }
         let code = monitor.diagnostics[app.id] ?? ""
@@ -289,6 +378,10 @@ struct MonitorDashboard: View {
                 settingsSection("实验功能", symbol: "flask") {
                     settingRow("窗口观察", detail: "只读取可访问的状态控件；隐藏会话可能不可观察") {
                         Toggle("窗口观察", isOn: $monitor.windowObservation).labelsHidden().toggleStyle(.switch)
+                    }
+                    Divider()
+                    settingRow("Claude Code 结束提醒", detail: "依据 Claude Code 的 Stop 事件推断本轮结束；若被其他 hook 拦下继续运行，可能提前提醒") {
+                        Toggle("Claude Code 结束提醒", isOn: $monitor.notifyClaudeCodeEnds).labelsHidden().toggleStyle(.switch)
                     }
                     Divider()
                     settingRow("Gemini 结束提醒", detail: "界面推断，尚未通过完整实测；需同时开启窗口观察") {
@@ -416,4 +509,10 @@ extension View {
         return self.background(WatchTheme.surface, in: shape).clipShape(shape)
             .overlay(shape.strokeBorder(WatchTheme.border, lineWidth: 1))
     }
+}
+
+private struct PendingHook: Identifiable {
+    let target: HookTarget
+    let install: Bool
+    var id: String { target.rawValue + (install ? ":install" : ":remove") }
 }
